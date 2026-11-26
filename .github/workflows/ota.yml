@@ -1,4 +1,4 @@
-name: OTA scraper
+name: OTA scraper2
 on:
   workflow_dispatch:
   push:
