@@ -1,7 +1,4 @@
-
 name: OTA scraper
-
-
 on:
   workflow_dispatch:
   push:
