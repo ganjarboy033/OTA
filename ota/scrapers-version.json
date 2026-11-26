@@ -1,7 +1,8 @@
 {
-  "scraperVersion": 2,
-  "updatedAt": 1795654364555,
+  "scraperVersion": 3,
+  "updatedAt": 1795691711014,
   "minAppVersion": "1.0.0",
-  "sourceHash": "1093298c082015e72e2e57f198c6644f0ac4a22450e8b589c6bad9781dd68d88",
-  "changelog": "update 2026-11-26"
+  "sourceHash": "0887db753cfe3ef9320fb1e777fba0f6bbf801ba373957989bd2c70e788fc5fc",
+  "bodyHash": "23273f40dce6e87b039991319461c3fb64d8fcfbbf2cf29257efe619297afa68",
+  "changelog": "otomatis | scrapr 1.4.1 @a7c584b (17 platform)"
 }
