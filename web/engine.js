@@ -2,7 +2,7 @@
    Semua jaringan lewat satu fungsi http() -> jembatan native NX (CORS-free, header bebas). */
 (() => {
 'use strict';
-const SV = 1;   // scraperVersion bawaan (naikkan tiap rilis bundle OTA)
+const SV = 2;   // scraperVersion bawaan (naikkan tiap rilis bundle OTA)
 const W = window, N = W.NX;
 const UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36';
 const DUA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
