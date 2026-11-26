@@ -1,7 +1,7 @@
 {
   "scraperVersion": 2,
-  "updatedAt": 1795653769975,
-  "minAppVersion": "2.0.0",
-  "sourceHash": "7393f3e6bc0048cc9f11e6cb3bc1c4ba85d95b19effaba84e5e5e1c4549222ed",
+  "updatedAt": 1795654364555,
+  "minAppVersion": "1.0.0",
+  "sourceHash": "1093298c082015e72e2e57f198c6644f0ac4a22450e8b589c6bad9781dd68d88",
   "changelog": "update 2026-11-26"
 }
