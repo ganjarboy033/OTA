@@ -1,10 +1,19 @@
-name: OTA scraper2
+name: OTA scraper
 on:
   workflow_dispatch:
   push:
-    paths: ['web/engine.js']
+    paths: ['web/engine.js', 'tools/make-ota.js']
+  schedule:
+    - cron: '17 */6 * * *'        # cek upstream scrapr tiap 6 jam
 permissions:
   contents: write
+concurrency:
+  group: ota
+  cancel-in-progress: false
+env:
+  # Kosongkan = ikuti branch utama upstream (otomatis terbaru).
+  # Isi nama tag/branch (mis. v1.4.1) untuk "mengunci" versi yang sudah kamu periksa.
+  SCRAPR_REF: ''
 jobs:
   ota:
     runs-on: ubuntu-latest
@@ -12,11 +21,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
+      - name: Ambil upstream scrapr
+        run: |
+          if [ -n "$SCRAPR_REF" ]; then B="--branch $SCRAPR_REF"; else B=""; fi
+          git clone --depth 1 $B https://github.com/coflyn/scrapr.git upstream-scrapr
       - run: npm i esbuild --no-save
-      - run: node tools/make-ota.js "update $(date +%F)"
-      - run: |
+      - name: Terjemahkan scrapr + gabung engine
+        run: |
+          SHA=$(git -C upstream-scrapr rev-parse --short HEAD)
+          SCRAPR_DIR=upstream-scrapr SCRAPR_SHA=$SHA node tools/make-ota.js "otomatis"
+      - name: Commit hasil (hanya jika berubah)
+        run: |
           git config user.name github-actions
           git config user.email actions@github.com
           git add ota
-          git commit -m "ota" || echo "no changes"
-          git push
+          if git diff --cached --quiet; then echo "tidak ada perubahan"; else git commit -m "ota: $(date +%F)" && git push; fi

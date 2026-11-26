@@ -1,0 +1,9 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'com.nimiyo.nexora'
+    compileSdk 34
+    defaultConfig { applicationId 'com.nimiyo.nexora'; minSdk 24; targetSdk 34; versionCode 1; versionName '1.0.0' }
+    buildTypes { release { minifyEnabled false; signingConfig signingConfigs.debug } }
+    sourceSets { main { assets.srcDirs = ['../../web'] } }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_1_8; targetCompatibility JavaVersion.VERSION_1_8 }
+}

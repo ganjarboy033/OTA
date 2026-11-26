@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="id"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0c1020">
+<title>Nimiyo × Nexora</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body data-mode="dark">
+<header class="topbar">
+  <div class="brand"><span class="brand-mark"><svg viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#fff" stop-opacity=".95"/><stop offset="1" stop-color="#fff" stop-opacity=".7"/></linearGradient></defs><path d="M14 47V17h8l20 19V17h8v30h-8L22 28v19z" fill="url(#g)"/><circle cx="49" cy="14" r="5" fill="#71e1dc"/></svg></span>
+    <div class="brand-copy"><strong id="appName">Nimiyo</strong><small>NEXORA · DOWNLOADER</small></div></div>
+  <div class="pill" id="verPill"><span class="dot"></span><span id="verTxt">scraper v1</span></div>
+</header>
+
+<main id="main">
+<!-- HOME -->
+<section class="page active" id="p-home">
+  <div class="hero">
+    <div class="orb o1"></div><div class="orb o2"></div>
+    <div class="eyebrow" data-t="hero_k">MEDIA DOWNLOADER</div>
+    <h2 data-t="hero_h">Tempel link, unduh media.</h2>
+    <p data-t="hero_p">16 platform dalam satu aplikasi ringan.</p>
+    <div class="inrow"><input id="url" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://…" data-tp="ph_url">
+      <button class="ib" id="btnPaste" aria-label="Tempel">⎘</button></div>
+    <div class="btnrow"><button class="btn primary" id="btnGo" data-t="analyze">Analisis</button><button class="btn" id="btnClr" data-t="clear">Bersihkan</button></div>
+    <div class="status" id="status"></div>
+  </div>
+  <div id="result" class="panel hidden"></div>
+  <div class="sec"><span class="eyebrow" data-t="platforms">PLATFORM DIDUKUNG</span></div>
+  <div class="chips" id="chips"></div>
+</section>
+
+<!-- HISTORY -->
+<section class="page" id="p-hist">
+  <div class="sec"><h3 data-t="history">Riwayat</h3><button class="btn sm danger" id="histClear" data-t="clear_all">Hapus semua</button></div>
+  <input id="histQ" class="search" placeholder="Cari…" data-tp="ph_search">
+  <div id="histList" class="list"></div>
+</section>
+
+<!-- PLAYER -->
+<section class="page" id="p-play">
+  <div class="sec"><h3 data-t="player">Pemutar</h3>
+    <label class="btn sm primary" for="fileIn" data-t="add_files">+ Tambah file</label>
+    <input id="fileIn" type="file" accept="audio/*,video/*" multiple hidden></div>
+  <div class="panel pl">
+    <video id="av" playsinline preload="metadata"></video>
+    <div class="np"><b id="npT">—</b><small id="npS"></small></div>
+    <input type="range" id="seek" min="0" max="1000" value="0"><div class="tm"><span id="tC">0:00</span><span id="tD">0:00</span></div>
+    <div class="ctl"><button class="ib" id="bShuf" title="Shuffle">⇄</button><button class="ib" id="bPrev">⏮</button><button class="ib big" id="bPlay">▶</button><button class="ib" id="bNext">⏭</button><button class="ib" id="bRep" title="Repeat">↻</button></div>
+    <div class="ctl2"><label><span data-t="speed">Kecepatan</span><select id="spd"><option>0.5</option><option>0.75</option><option selected>1</option><option>1.25</option><option>1.5</option><option>2</option></select></label>
+      <label><span data-t="sleep">Timer tidur</span><select id="slp"><option value="0">Off</option><option value="15">15 m</option><option value="30">30 m</option><option value="60">60 m</option></select></label></div>
+  </div>
+  <div class="sec"><span class="eyebrow" data-t="queue">ANTREAN</span><button class="btn sm" id="qClr" data-t="clear">Bersihkan</button></div>
+  <div id="queue" class="list"></div>
+</section>
+
+<!-- THEME -->
+<section class="page" id="p-theme">
+  <div class="sec"><h3>Theme Studio</h3><button class="btn sm" id="thReset" data-t="reset">Reset</button></div>
+  <div class="panel">
+    <div class="eyebrow" data-t="mode">MODE</div>
+    <div class="seg" id="segMode"><button data-v="dark">Dark</button><button data-v="light">Light</button><button data-v="amoled">AMOLED</button></div>
+    <div class="eyebrow" style="margin-top:16px" data-t="accent">WARNA AKSEN</div>
+    <div class="presets" id="presets"></div>
+    <div class="hexrow"><input type="color" id="accPick"><input id="accHex" maxlength="7" placeholder="#9b7cff"></div>
+    <div class="rng"><label><span data-t="radius">Radius</span><b id="radV"></b></label><input type="range" id="rad" min="6" max="28"></div>
+    <div class="rng"><label><span data-t="font">Ukuran font</span><b id="fntV"></b></label><input type="range" id="fnt" min="88" max="118"></div>
+    <div class="sw"><div><b data-t="glass">Efek kaca (blur)</b><small data-t="glass_s">Matikan jika perangkat terasa berat</small></div><label class="tg"><input type="checkbox" id="glass"><i></i></label></div>
+    <div class="sw"><div><b data-t="orbs">Animasi orb</b><small data-t="orbs_s">Hiasan banner beranda</small></div><label class="tg"><input type="checkbox" id="orbs"><i></i></label></div>
+    <div class="eyebrow" style="margin-top:14px" data-t="brand">NAMA APLIKASI</div>
+    <input id="brand" class="search" maxlength="18" placeholder="Nimiyo">
+  </div>
+</section>
+
+<!-- SETTINGS -->
+<section class="page" id="p-set">
+  <div class="sec"><h3 data-t="settings">Setelan</h3></div>
+  <div class="panel">
+    <div class="eyebrow" data-t="general">UMUM</div>
+    <div class="sw"><div><b data-t="lang">Bahasa</b></div><div class="seg sm" id="segLang"><button data-v="id">ID</button><button data-v="en">EN</button></div></div>
+    <div class="sw"><div><b data-t="autopaste">Tempel otomatis dari clipboard</b><small data-t="autopaste_s">Saat aplikasi dibuka, jika isi clipboard berupa link yang didukung</small></div><label class="tg"><input type="checkbox" id="autoPaste"><i></i></label></div>
+    <div class="sw"><div><b data-t="autogo">Analisis otomatis</b><small data-t="autogo_s">Langsung analisis setelah menempel / berbagi link</small></div><label class="tg"><input type="checkbox" id="autoGo"><i></i></label></div>
+    <div class="rng"><label><span data-t="timeout">Batas waktu jaringan (detik)</span><b id="toV"></b></label><input type="range" id="to" min="10" max="120" step="5"></div>
+    <div class="eyebrow" style="margin-top:14px" data-t="folder">FOLDER UNDUHAN</div>
+    <input id="folder" class="search" maxlength="30" placeholder="Nimiyo">
+    <button class="btn" style="margin-top:10px;width:100%" id="openDl" data-t="open_dl">Buka folder Unduhan</button>
+  </div>
+
+  <div class="panel" style="margin-top:14px" id="otaBox">
+    <div class="eyebrow" data-t="ota">UPDATE SCRAPER (OTA)</div>
+    <p class="muted" data-t="ota_p">Perbarui script scraper tanpa memasang APK baru. Bundle diverifikasi SHA-256 sebelum dipakai.</p>
+    <div class="kv"><span data-t="ota_cur">Versi aktif</span><b id="otaCur">—</b></div>
+    <div class="kv"><span data-t="ota_last">Pemeriksaan terakhir</span><b id="otaLast">—</b></div>
+    <div class="kv"><span data-t="ota_log">Catatan</span><b id="otaLog">—</b></div>
+    <div class="eyebrow" style="margin-top:12px" data-t="ota_url">URL SUMBER UPDATE</div>
+    <input id="otaUrl" class="search" inputmode="url" autocapitalize="off" spellcheck="false" placeholder="https://raw.githubusercontent.com/USER/REPO/main/public">
+    <div class="sw"><div><b data-t="ota_auto">Cek otomatis</b><small data-t="ota_auto_s">Maks. sekali per 6 jam saat aplikasi dibuka</small></div><label class="tg"><input type="checkbox" id="otaAuto"><i></i></label></div>
+    <div class="btnrow"><button class="btn primary" id="otaCheck" data-t="ota_check">Cek & perbarui</button><button class="btn" id="otaReset" data-t="ota_reset">Kembali ke bawaan</button></div>
+    <div class="status" id="otaSt"></div>
+  </div>
+
+  <div class="panel" style="margin-top:14px">
+    <div class="eyebrow" data-t="data">DATA</div>
+    <div class="btnrow"><button class="btn danger" id="clrHist" data-t="clear_hist">Hapus riwayat</button><button class="btn danger" id="clrAll" data-t="clear_data">Reset semua setelan</button></div>
+    <p class="muted" style="margin-top:12px">Nimiyo × Nexora · v<span id="appVer">1.0.0</span></p>
+  </div>
+</section>
+</main>
+
+<nav class="nav" id="nav">
+  <button class="ni active" data-p="home"><i>⌂</i><span data-t="n_home">Beranda</span></button>
+  <button class="ni" data-p="hist"><i>◷</i><span data-t="n_hist">Riwayat</span></button>
+  <button class="ni" data-p="play"><i>♪</i><span data-t="n_play">Pemutar</span></button>
+  <button class="ni" data-p="theme"><i>◈</i><span data-t="n_theme">Tema</span></button>
+  <button class="ni" data-p="set"><i>⚙</i><span data-t="n_set">Setelan</span></button>
+</nav>
+
+<div id="modal" class="modal hidden"><div class="mbox"><button class="ib x" id="mClose">✕</button><div id="mBody"></div></div></div>
+<div id="toasts"></div>
+<script src="engine.js"></script>
+<script src="app.js"></script>
+</body></html>

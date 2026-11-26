@@ -2,7 +2,7 @@
    Semua jaringan lewat satu fungsi http() -> jembatan native NX (CORS-free, header bebas). */
 (() => {
 'use strict';
-const SV = 2;   // scraperVersion bawaan (naikkan tiap rilis bundle OTA)
+const SV = 1;   // scraperVersion bawaan (naikkan tiap rilis bundle OTA)
 const W = window, N = W.NX;
 const UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36';
 const DUA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
@@ -533,6 +533,53 @@ const SRC = {
   shopee: [['svxtract', shopee]], soundcloud: [['forhub', soundcloud]],
   spotify: [['spotimate', u => mate('spotify', u)]], applemusic: [['aplmate', u => mate('apple', u)]], bandcamp: [['bandcampdl', u => mate('bandcamp', u)]],
 };
+/* ---------- Adapter scrapr: sumber tambahan dari upstream (coflyn/scrapr) ----------
+   tools/make-ota.js menerjemahkan scrapr menjadi window.__SCRAPR dan menempelkannya di depan file ini.
+   Tanpa __SCRAPR (APK bawaan) bagian ini tidak melakukan apa-apa. */
+const EXTRA = {
+  reddit: ['Reddit', /reddit\.com|redd\.it/i],
+  terabox: ['Terabox', /tera(?:box|share)|1024tera|4funbox|mirrobox|nephobox|freeterabox/i],
+};
+function fromScrapr(r) {
+  if (!r || r.status === false) throw new Error((r && r.message) || 'Gagal');
+  const x = r.result || r, items = [], kmap = { video: 'video', audio: 'audio', image: 'image', photo: 'image', file: 'file' };
+  let ni = 0;
+  (x.downloads || []).forEach(d => {
+    if (!d || !d.url) return;
+    const q = String(d.quality || '').trim(), k = kmap[d.type] || kindOf(q, d.url), o = { kind: k };
+    let label = k === 'image' ? (/^(photo|image|foto)?$/i.test(q) ? 'Foto ' + (++ni) : q)
+      : k === 'audio' ? (/mp3|m4a|flac|wav|kbps/i.test(q) ? q : ('MP3 ' + q).trim())
+      : (/mp4|webm|mkv/i.test(q) ? q : ('MP4 ' + q).trim());
+    if (d.isMirror) label += ' (mirror)';
+    if (d.headers && typeof d.headers === 'object') o.h = d.headers;
+    if (d.thumbnail) o.thumb = d.thumbnail;
+    const fx = d.filename && (String(d.filename).match(/\.([a-z0-9]{2,4})$/i) || [])[1]; if (fx) o.ext = fx.toLowerCase();
+    items.push(it(label, d.url, o));
+  });
+  if (!items.length && Array.isArray(x.items)) {
+    const pad = String(x.items.length).length;
+    x.items.forEach((v, i) => v && v.url && items.push(it(String(i + 1).padStart(pad, '0') + '. ' + (v.author ? v.author + ' - ' : '') + (v.title || 'Track') + ' [MP3]', '', { kind: 'audio', ext: 'mp3', thumb: v.thumbnail, lazy: { k: 'run', url: v.url, kind: 'audio' } })));
+  }
+  if (!items.length) throw new Error('Tidak ada tautan unduhan');
+  return { title: x.title || 'Media', author: x.author || x.artist || '', thumb: x.thumbnail || x.thumb || '', items };
+}
+function adoptScrapr() {
+  const S = W.__SCRAPR; if (!S) return;
+  Object.keys(S).forEach(p => {
+    const mod = S[p]; if (!mod || typeof mod !== 'object') return;
+    if (!PL.some(x => x[0] === p)) { const e = EXTRA[p]; if (!e) return; PL.push([p, e[0], e[1]]); }
+    const list = SRC[p] || (SRC[p] = []);
+    Object.keys(mod).forEach(sn => {
+      const fn = mod[sn]; if (typeof fn !== 'function') return;
+      list.push(['scrapr:' + sn, async u => {
+        if (sn === 'playlist' && !/[?&]list=/.test(u)) throw new Error('bukan playlist');
+        return fromScrapr(await fn(u));
+      }]);
+    });
+  });
+}
+
+adoptScrapr();
 async function run(input, status) {
   const url = clean(input); if (!url) throw new Error('Tempel link terlebih dulu');
   const p = detect(url); if (!p) throw new Error('Platform belum didukung');
@@ -551,8 +598,9 @@ async function resolve(item) {
   if (!item.lazy) return item;
   const l = item.lazy;
   if (l.k === 'yt') { const r = await ytGet(l.id, l.f); if (!r) throw new Error('Konversi gagal'); return Object.assign({}, item, { url: r.url }); }
+  if (l.k === 'run') { const r = await run(l.url); const p = r.items.find(x => x.kind === l.kind && x.url) || r.items.find(x => x.url); if (!p) throw new Error('Tautan tidak ditemukan'); return Object.assign({}, item, { url: p.url, h: p.h }); }
   if (l.k === 'mate') { const L = (await mateTrack(l.m, l.ck, l.f)).filter(x => !x.cover); if (!L[0]) throw new Error('Tautan tidak ditemukan'); return Object.assign({}, item, { url: L[0].url }); }
   return item;
 }
-W.E = { v: SV, run, resolve, detect, clean, PL, http, UA };
+W.E = { v: SV, scrapr: W.__SCRAPR_INFO || null, src: SRC, run, resolve, detect, clean, PL, http, UA };
 })();
