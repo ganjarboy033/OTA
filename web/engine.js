@@ -1,2669 +1,558 @@
-import fs from "fs";
-import os from "os";
-import path from "path";
-import { exec, execSync } from "child_process";
-import { fileURLToPath } from "url";
-import { createRequire } from "module";
-import { DOMParser } from "linkedom";
+/* Nimiyo-Nexora engine — scraper ringkas untuk 16 platform.
+   Semua jaringan lewat satu fungsi http() -> jembatan native NX (CORS-free, header bebas). */
+(() => {
+'use strict';
+const SV = 1;   // scraperVersion bawaan (naikkan tiap rilis bundle OTA)
+const W = window, N = W.NX;
+const UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36';
+const DUA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+const IUA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const form = o => Object.keys(o).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(o[k])).join('&');
+const tmo = () => Math.min(180, Math.max(5, +localStorage.getItem('nx_timeout') || 30)) * 1000;
+let seq = 0;
 
-const require = createRequire(import.meta.url);
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT_DIR = path.resolve(__dirname, "..");
-
-// 1. Polyfill browser / native globals for scraper bundle
-globalThis.window = globalThis;
-globalThis.DOMParser = DOMParser;
-
-const mockStorage = new Map([
-  ["mori_request_timeout", "30"],
-  ["mori_header_spoofing", "true"],
-  ["mori_bypass_ssl", "false"],
-  ["mori_force_ipv4", "false"],
-  ["mori_doh", "off"],
-]);
-
-globalThis.localStorage = {
-  getItem: (key) => (mockStorage.has(key) ? mockStorage.get(key) : null),
-  setItem: (key, val) => mockStorage.set(key, String(val)),
-  removeItem: (key) => mockStorage.delete(key),
-  clear: () => mockStorage.clear(),
-};
-
-const CHROME_DESKTOP_UA =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
-const CHROME_MOBILE_UA =
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
-export const CHROME_UA =
-  "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36";
-
-function getUserAgent() {
-  return CHROME_UA;
-}
-
-function getCookiesFromHeaders(headers) {
-  const raw = headers["Set-Cookie"] || headers["set-cookie"] || "";
-  if (!raw) return "";
-  if (Array.isArray(raw)) return raw.map((c) => c.split(";")[0]).join("; ");
-  return raw
-    .split(/,(?=\s*[^;,=]+=[^;]*)/)
-    .map((c) => c.trim().split(";")[0])
-    .filter((c) => c && c.includes("="))
-    .join("; ");
-}
-
-function serializeData(obj) {
-  return Object.keys(obj)
-    .map((k) => encodeURIComponent(k) + "=" + encodeURIComponent(obj[k]))
-    .join("&");
-}
-
-function cleanUrl(u) {
-  if (!u) return "";
-  const clean = u.split("?")[0];
-  const shortsMatch = clean.match(/(?:youtube\.com\/shorts\/|youtu\.be\/)([^"&?/\s]{11})/i);
-  if (shortsMatch) {
-    return `https://www.youtube.com/watch?v=${shortsMatch[1]}`;
-  }
-  return clean;
-}
-
-const SAFARI_MOBILE_UA = CHROME_MOBILE_UA;
-
-function decodeSnapSave(data) {
-  try {
-    const regex =
-      /eval\(function\(h,u,n,t,e,r\)\{.*?\}\("(.*?)",(\d+),"(.*?)",(\d+),(\d+),(\d+)\)\)/;
-    const match = data.match(regex);
-    if (match) {
-      const h = match[1],
-        u = parseInt(match[2]),
-        n = match[3],
-        t = parseInt(match[4]),
-        e = parseInt(match[5]);
-      const delimiter = n[e],
-        parts = h.split(delimiter);
-      let decoded = "";
-      for (let s of parts) {
-        if (s === "") continue;
-        let val = 0;
-        for (let j = 0; j < s.length; j++)
-          val += n.indexOf(s[j]) * Math.pow(e, s.length - 1 - j);
-        decoded += String.fromCharCode(val - t);
-      }
-      try {
-        return decodeURIComponent(escape(decoded));
-      } catch {
-        return Buffer.from(decoded, "binary").toString("utf-8");
-      }
-    }
-    return data;
-  } catch (err) {
-    return data;
-  }
-}
-
-function extractFinalUrl(input) {
-  if (!input) return null;
-  let raw = input.trim().replace(/^["'\\]+|["'\\]+$/g, ""),
-    isRender = false;
-  if (raw.includes("get_progressApi") || raw.includes("get_progress")) {
-    isRender = true;
-    const tokenMatch = raw.match(/token=([^&'"]+)/);
-    if (tokenMatch) raw = tokenMatch[1];
-  }
-  if (raw.includes(".") && !raw.startsWith("http")) {
-    try {
-      const payloadPart = raw.split(".")[1];
-      if (payloadPart) {
-        const payload = JSON.parse(
-          Buffer.from(payloadPart, "base64").toString("utf-8")
-        );
-        if (payload.video_url)
-          return { url: payload.video_url, isRender: true };
-        if (payload.url) return { url: payload.url, isRender: false };
-      }
-    } catch (e) {}
-  }
-  if (raw.startsWith("//")) return { url: "https:" + raw, isRender };
-  if (raw.startsWith("/"))
-    return { url: "https://snapsave.app" + raw, isRender };
-  return { url: raw, isRender };
-}
-
-globalThis.window.__moriDeps = {
-  utils: {
-    CHROME_UA,
-    CHROME_DESKTOP_UA,
-    CHROME_MOBILE_UA,
-    SAFARI_MOBILE_UA,
-    getUserAgent,
-    cleanUrl,
-    getCookiesFromHeaders,
-    serializeData,
-    decodeSnapSave,
-    extractFinalUrl,
-  },
-  urlUtils: {
-    getCleanUrl: (u) => (u ? u.trim() : ""),
-    cleanUrl,
-    extractCleanUrl: (text) => {
-      if (!text || typeof text !== "string") return "";
-      const match = text.match(/https?:\/\/[^\s]+/i);
-      return match ? match[0] : text.trim();
-    },
-  },
-  core: {
-    t: (k) => k,
-  },
-};
-
-// 2. Persistent User Configuration & History
-export const CONFIG_DIR = path.join(os.homedir(), ".mori");
-export const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
-export const HISTORY_PATH = path.join(CONFIG_DIR, "history.json");
-export const DEFAULT_DOWNLOAD_DIR = path.join(
-  os.homedir(),
-  "Downloads",
-  "Mori",
-);
-
-export function getSavedConfig() {
-  if (fs.existsSync(CONFIG_PATH)) {
-    try {
-      return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
-    } catch (_) {}
-  }
-  return {};
-}
-
-export function saveConfig(updates) {
-  if (!fs.existsSync(CONFIG_DIR)) {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  }
-  const current = getSavedConfig();
-  const merged = { ...current, ...updates };
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2), "utf8");
-  return merged;
-}
-
-export function openDirectory(dirPath) {
-  const plat = process.platform;
-  const cmd =
-    plat === "darwin"
-      ? `open "${dirPath}"`
-      : plat === "win32"
-        ? `start "" "${dirPath}"`
-        : `xdg-open "${dirPath}"`;
-  return new Promise((resolve, reject) => {
-    exec(cmd, (err) => (err ? reject(err) : resolve()));
+/* ---------- HTTP ---------- */
+function parseRes(raw) {
+  const a = raw.split('\u0001');
+  const r = { status: +a[0] || 0, url: a[1] || '', text: a.slice(3).join('\u0001'), headers: {}, cookies: [] };
+  if (r.url === 'ERR') throw new Error(r.text || 'Jaringan gagal');
+  (a[2] || '').split('\n').forEach(l => {
+    const i = l.indexOf(':'); if (i < 1) return;
+    const k = l.slice(0, i).trim().toLowerCase(), v = l.slice(i + 1).trim();
+    k === 'set-cookie' ? r.cookies.push(v) : (r.headers[k] = v);
   });
+  r.ck = r.cookies.map(c => c.split(';')[0]).join('; ');
+  return r;
+}
+async function http(o) {
+  const m = (o.method || (o.data != null ? 'POST' : 'GET')).toUpperCase();
+  const h = Object.assign({ 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9,id;q=0.8' }, o.headers || {});
+  let body = '';
+  if (o.data != null) {
+    if (typeof o.data === 'object') {
+      if (!h['Content-Type']) h['Content-Type'] = 'application/json';
+      body = /urlencoded/.test(h['Content-Type']) ? form(o.data) : JSON.stringify(o.data);
+    } else body = String(o.data);
+  }
+  const t = o.timeout || tmo();
+  if (N) {
+    const id = 'r' + (++seq);
+    N.req(id, [m, o.url, Object.entries(h).map(([k, v]) => k + ': ' + v).join('\n'), body, String(t)].join('\u0001'));
+    const t0 = Date.now();
+    while (Date.now() - t0 < t + 4000) { await sleep(60); const r = N.poll(id); if (r) return parseRes(r); }
+    throw new Error('Waktu habis');
+  }
+  const c = new AbortController(), to = setTimeout(() => c.abort(), t);   // mode browser (dev)
+  try {
+    const r = await fetch(o.url, { method: m, headers: h, body: body || undefined, signal: c.signal });
+    return { status: r.status, url: r.url, text: await r.text(), headers: {}, cookies: [], ck: '' };
+  } finally { clearTimeout(to); }
+}
+const J = (r, n = 'Server') => {
+  const t = (r.text || '').trim();
+  if (t[0] === '<') throw new Error(n + ' memblokir / rate-limit');
+  try { return JSON.parse(t); } catch (e) { throw new Error(n + ': respons tidak valid'); }
+};
+const jget = async (url, h, n) => J(await http({ url, headers: h }), n);
+const DOM = h => new DOMParser().parseFromString(h || '', 'text/html');
+const abs = (h, b) => { try { return new URL(h, b).href; } catch (_) { return h; } };
+const text = e => (e && e.textContent || '').replace(/\s+/g, ' ').trim();
+const mp = o => { const b = '----nx' + Math.random().toString(36).slice(2); let s = ''; for (const k in o) s += `--${b}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${o[k]}\r\n`; return { body: s + `--${b}--\r\n`, type: 'multipart/form-data; boundary=' + b }; };
+const b64j = s => { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; return JSON.parse(atob(s)); };
+const uniq = (a, f) => { const s = new Set(); return a.filter(x => { const k = f(x); if (s.has(k)) return false; s.add(k); return true; }); };
+
+/* ---------- Items ---------- */
+const kindOf = (l, u) => {
+  const s = (l + ' ' + u).toLowerCase();
+  if (/mp3|m4a|audio|music|flac|wav|\.aac|cover/.test(s) && !/cover/.test(l.toLowerCase())) return 'audio';
+  if (/image|photo|foto|jpg|jpeg|png|webp|cover|\.gif/.test(s)) return 'image';
+  return /mp3|m4a|audio|\.aac/.test(s) ? 'audio' : 'video';
+};
+const extOf = (l, u, k) => {
+  const m = (u.split('?')[0].match(/\.(mp4|m4a|mp3|webm|mkv|flac|wav|jpe?g|png|webp|gif|zip)$/i) || [])[1];
+  if (m) return m.toLowerCase().replace('jpeg', 'jpg');
+  return k === 'audio' ? 'mp3' : k === 'image' ? (/png/i.test(l + u) ? 'png' : 'jpg') : 'mp4';
+};
+const it = (label, url, o = {}) => { const k = o.kind || kindOf(label, url); return Object.assign({ label, url, kind: k, ext: o.ext || extOf(label, url || '', k) }, o); };
+
+/* ---------- URL ---------- */
+const PL = [
+  ['youtube', 'YouTube', /youtu\.?be/i], ['tiktok', 'TikTok', /tiktok\.com/i], ['instagram', 'Instagram', /instagram\.com|instagr\.am/i],
+  ['twitter', 'X / Twitter', /(?:twitter|x|fxtwitter|vxtwitter|fixupx)\.com/i], ['facebook', 'Facebook', /facebook\.com|fb\.watch|fb\.com/i],
+  ['threads', 'Threads', /threads\.(?:net|com)/i], ['pinterest', 'Pinterest', /pinterest\.|pin\.it/i],
+  ['bilibili', 'Bilibili', /bilibili\.|b23\.tv|bili\.im/i], ['pixiv', 'Pixiv', /pixiv\.net/i],
+  ['douyin', 'Douyin', /douyin\.com|iesdouyin/i], ['rednote', 'RedNote', /xiaohongshu\.com|xhslink\.|rednote\.com/i],
+  ['shopee', 'Shopee Video', /shopee\.|shp\.ee/i], ['soundcloud', 'SoundCloud', /soundcloud\.com|snd\.sc/i],
+  ['spotify', 'Spotify', /spotify\.com|spotify\.link/i], ['applemusic', 'Apple Music', /music\.apple\.com/i], ['bandcamp', 'Bandcamp', /bandcamp\.com/i],
+];
+const detect = u => { const p = PL.find(x => x[2].test(u)); return p ? p[0] : null; };
+function clean(t) {
+  if (!t) return '';
+  const m = String(t).match(/https?:\/\/[^\s]+/);
+  let u = m ? m[0] : String(t).trim();
+  if (!u) return '';
+  if (!/^https?:\/\//.test(u)) u = 'https://' + u;
+  try {
+    const x = new URL(u), h = x.hostname;
+    ['igsh', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 's', 't', 'si', 'feature'].forEach(p => x.searchParams.delete(p));
+    if (/tiktok\.com/.test(h)) x.search = '';
+    else if (/youtube\.com|youtu\.be/.test(h)) { if (x.searchParams.has('v')) { const v = x.searchParams.get('v'), l = x.searchParams.get('list'); x.search = ''; x.searchParams.set('v', v); if (l) x.searchParams.set('list', l); } }
+    else if (!/xiaohongshu|rednote|xhslink|facebook|bilibili/.test(h) && !x.searchParams.has('id') && !x.searchParams.has('story_fbid')) x.search = '';
+    return x.href.replace(/\/$/, '');
+  } catch (_) { return u.split('?')[0].replace(/\/$/, ''); }
 }
 
-export function readClipboard() {
-  const plat = process.platform;
-  let cmd = "";
-  if (plat === "darwin") {
-    cmd = "pbpaste";
-  } else if (plat === "win32") {
-    cmd = 'powershell.exe -NoProfile -Command "Get-Clipboard"';
+/* ---------- Pola umum "snap*" ---------- */
+const BAD = /ko-fi|premium|play\.google|apps\.apple|t\.me|telegram|whatsapp|sharer|intent\/tweet|javascript:|paypal|patreon|chrome\.google|#$/i;
+function anchors(doc, base) {
+  const out = [];
+  doc.querySelectorAll('a[href]').forEach(a => {
+    let h = (a.getAttribute('href') || '').trim(); if (!h || h === '#' || BAD.test(h)) return;
+    h = abs(h, base); if (/^https?:/.test(h)) out.push({ h, t: text(a), c: a.className || '', a });
+  });
+  return out;
+}
+function dss(d) {
+  const m = d.match(/eval\(function\(h,u,n,t,e,r\)\{.*?\}\("(.*?)",(\d+),"(.*?)",(\d+),(\d+),(\d+)\)\)/);
+  if (!m) return null;
+  const h = m[1], n = m[3], t = +m[4], e = +m[5], dl = n[e]; let o = '';
+  for (const s of h.split(dl)) { if (s === '') continue; let v = 0; for (let j = 0; j < s.length; j++) v += n.indexOf(s[j]) * Math.pow(e, s.length - 1 - j); o += String.fromCharCode(v - t); }
+  try { return decodeURIComponent(escape(o)); } catch (_) { return o; }
+}
+function ssHtml(t) {
+  let d = dss(t); if (!d) return t;
+  const i = d.indexOf('innerHTML = "');
+  if (i > -1) {
+    let raw = d.slice(i + 13, d.lastIndexOf('"'));
+    try { raw = JSON.parse('"' + raw + '"'); } catch (_) { raw = raw.replace(/\\"/g, '"').replace(/\\\//g, '/').replace(/\\n|\\r|\\t/g, ''); }
+    return raw;
+  }
+  return d;
+}
+function ssUrl(v) {
+  if (!v) return null;
+  let raw = v.trim().replace(/^["'\\]+|["'\\]+$/g, '');
+  const tk = raw.includes('get_progressApi') && raw.match(/token=([^&'"]+)/); if (tk) raw = tk[1];
+  if (raw.includes('.') && !/^https?:|^\//.test(raw)) { try { const p = b64j(raw.split('.')[1]); if (p.video_url) return p.video_url; if (p.url) return p.url; } catch (_) {} }
+  if (raw.startsWith('//')) return 'https:' + raw;
+  if (raw[0] === '/') return 'https://snapsave.app' + raw;
+  return raw;
+}
+async function snapsave(url, path) {
+  const H = { Origin: 'https://snapsave.app', Referer: 'https://snapsave.app' + (path === 'id' ? '/id' : '/'), 'X-Requested-With': 'XMLHttpRequest', 'User-Agent': DUA };
+  let ck = '';
+  if (path === 'id') ck = (await http({ url: 'https://snapsave.app/id', headers: H })).ck;
+  const r = await http({ url: path === 'id' ? 'https://snapsave.app/action.php?lang=id' : 'https://snapsave.app/action.php', data: form({ url }), headers: Object.assign({ 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', Cookie: ck }, H) });
+  const doc = DOM(ssHtml(r.text)), items = [];
+  const rows = doc.querySelectorAll('table tbody tr');
+  if (rows.length) rows.forEach(tr => {
+    const q = text(tr.querySelector('td.video-quality')) || text(tr.querySelector('td')) || 'VIDEO';
+    const b = tr.querySelector('a.btn-download') || tr.querySelector('a') || tr.querySelector('button');
+    const u = ssUrl(b && (b.getAttribute('href') || b.getAttribute('onclick')));
+    if (u && /^https?:/.test(u)) items.push(it(q, u, { kind: 'video' }));
+  });
+  else doc.querySelectorAll('.download-items, .media-box, .download-item').forEach((box, i) => {
+    box.querySelectorAll('a[href]').forEach(a => { const u = ssUrl(a.getAttribute('href')); if (u && /^https?:/.test(u) && !BAD.test(u)) { const t = text(a) || 'Media'; items.push(it((/photo|foto|image/i.test(t) ? 'Foto ' : 'Video ') + (i + 1), u, { kind: /photo|foto|image/i.test(t) ? 'image' : 'video', thumb: box.querySelector('img') && box.querySelector('img').getAttribute('src') })); } });
+  });
+  if (!items.length) anchors(doc, 'https://snapsave.app').forEach(a => { if (/download|\.mp4|rapidcdn|snapcdn|token=/i.test(a.h + a.t)) items.push(it(a.t || 'Media', a.h)); });
+  if (!items.length) throw new Error('Tautan unduhan tidak ditemukan');
+  const th = doc.querySelector('.video-preview img, img:not([src*=logo])');
+  return { title: '', thumb: th ? abs(th.getAttribute('src') || '', 'https://snapsave.app') : '', items };
+}
+
+/* ---------- Keluarga "mate" (Spotify / Apple Music / Bandcamp) ---------- */
+const mhead = (b, ck, ref, ct) => ({ Origin: b, Referer: ref || b + '/', 'X-Requested-With': 'XMLHttpRequest', Cookie: ck || '', 'Content-Type': ct || 'application/x-www-form-urlencoded; charset=UTF-8', Accept: 'application/json, text/javascript, */*; q=0.01' });
+const MATE = {
+  spotify: { b: 'https://spotimate.app', ref: 'https://spotimate.app/en1', extra: { 'g-recaptcha-response': 'dummy_token' } },
+  apple: { b: 'https://aplmate.com', ref: 'https://aplmate.com/', extra: {} },
+  bandcamp: { b: 'https://bandcampdownloader.app', ref: 'https://bandcampdownloader.app/', extra: { type: '320' } },
+};
+async function mateTrack(k, ck, f) {
+  const c = MATE[k];
+  const r = await http({ url: c.b + '/action/track', data: form(Object.assign({}, f, c.extra)), headers: mhead(c.b, ck, c.ref) });
+  let h = r.text; try { const j = JSON.parse(h); h = j.data || j.html || ''; } catch (_) {}
+  const out = [];
+  anchors(DOM(h), c.b).forEach(a => {
+    if (/another song/i.test(a.t)) return;
+    if (/\/dl\?token=|abutton/.test(a.h + a.c) || (k === 'spotify' && /^https?:/.test(a.h))) {
+      const cov = /cover|i\.scdn\.co|\.(jpe?g|png|webp)($|\?)/i.test(a.t + a.h);
+      out.push({ url: a.h, cover: cov, t: a.t });
+    }
+  });
+  return out;
+}
+async function mate(k, url) {
+  const c = MATE[k]; let ck = '', fields = {};
+  const home = await http({ url: k === 'spotify' ? c.ref : c.b + '/', headers: { Accept: 'text/html,*/*' } });
+  ck = home.ck;
+  let html;
+  if (k === 'spotify') {
+    let token = '';
+    try { const v = await http({ url: c.b + '/api/userverify', data: 'url=' + encodeURIComponent(url), headers: mhead(c.b, ck, c.ref) }); if (v.ck) ck += '; ' + v.ck; const vj = JSON.parse(v.text); if (vj.success && vj.token) token = vj.token; } catch (_) {}
+    const m = mp({ url, cftoken: token });
+    const r = await http({ url: c.b + '/action', data: m.body, headers: { 'Content-Type': m.type, Referer: c.ref, Origin: c.b, Cookie: ck } });
+    if (r.ck) ck += '; ' + r.ck;
+    try { html = JSON.parse(r.text).html; } catch (_) { html = r.text; }
+  } else if (k === 'apple') {
+    const v = J(await http({ url: c.b + '/action/userverify', data: form({ url }), headers: mhead(c.b, ck, c.ref) }), 'Aplmate');
+    if (!v.success || !v.token) throw new Error(v.message || 'Verifikasi gagal');
+    const r = J(await http({ url: c.b + '/action', data: form({ url, 'cf-turnstile-response': v.token }), headers: mhead(c.b, ck, c.ref) }), 'Aplmate');
+    if (r.error) throw new Error(r.message || 'Gagal');
+    html = r.html;
   } else {
-    cmd =
-      "which wl-paste >/dev/null 2>&1 && wl-paste || xclip -selection clipboard -o 2>/dev/null || xsel -b -o 2>/dev/null";
+    const d1 = DOM(home.text), inp = d1.querySelector('form[name="submitbcurl"] input[type="hidden"]');
+    if (!inp) throw new Error('CSRF tidak ditemukan');
+    const r = J(await http({ url: c.b + '/action', data: form({ url, [inp.getAttribute('name')]: inp.getAttribute('value') }), headers: mhead(c.b, ck, c.ref) }), 'Bandcamp');
+    if (r.error || !r.html) throw new Error(r.message || 'Gagal memproses');
+    html = r.html;
   }
-  return new Promise((resolve) => {
-    exec(cmd, { encoding: "utf8", timeout: 2000 }, (err, stdout) => {
-      if (err || !stdout) return resolve("");
-      resolve(stdout.trim());
-    });
-  });
-}
-
-export function writeClipboard(text) {
-  if (!text) return Promise.resolve(false);
-  const plat = process.platform;
-  return new Promise((resolve) => {
-    let proc;
-    if (plat === "darwin") {
-      proc = exec("pbcopy", (err) => resolve(!err));
-    } else if (plat === "win32") {
-      proc = exec("clip", (err) => resolve(!err));
-    } else {
-      proc = exec(
-        "which wl-copy >/dev/null 2>&1 && wl-copy || xclip -selection clipboard 2>/dev/null || xsel -b -i 2>/dev/null",
-        (err) => resolve(!err),
-      );
-    }
-    if (proc && proc.stdin) {
-      proc.stdin.write(String(text));
-      proc.stdin.end();
-    } else {
-      resolve(false);
-    }
-  });
-}
-
-export function decodeHtmlEntities(str) {
-  if (!str || typeof str !== "string") return "";
-  return str
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#039;/g, "'")
-    .replace(/&#39;/g, "'")
-    .replace(/&apos;/g, "'")
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex) =>
-      String.fromCharCode(parseInt(hex, 16)),
-    )
-    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)));
-}
-
-export function getNonCollidingPath(dir, filename) {
-  let fullPath = path.join(dir, filename);
-  if (!fs.existsSync(fullPath)) return fullPath;
-
-  const ext = path.extname(filename);
-  const name = path.basename(filename, ext);
-  let count = 1;
-  while (fs.existsSync(path.join(dir, `${name}_${count}${ext}`))) {
-    count++;
+  if (!html || html.length < 50) throw new Error('Respons kosong');
+  const doc = DOM(html), forms = doc.querySelectorAll('form[name="submitapurl"], form[name="submitspurl"], form[name="submiturl"]');
+  if (!forms.length) throw new Error('Lagu tidak ditemukan');
+  const multi = forms.length > 1, items = [];
+  const mainThumb = (doc.querySelector('img') || {}).src || '', mainTitle = text(doc.querySelector('h3'));
+  for (let i = 0; i < forms.length; i++) {
+    const f = forms[i]; fields = {};
+    f.querySelectorAll('input').forEach(x => { const n = x.getAttribute('name'); if (n) fields[n] = x.getAttribute('value') || ''; });
+    let meta = {}; try { meta = JSON.parse(atob(fields.data || '')); } catch (_) {}
+    const nm = meta.name || meta.title || 'Track ' + (i + 1), ar = meta.artist || meta.singer || '';
+    const lab = (multi ? String(i + 1).padStart(String(forms.length).length, '0') + '. ' : '') + (ar ? ar + ' - ' : '') + nm;
+    if (!multi) {
+      const L = await mateTrack(k, ck, fields);
+      L.forEach(l => items.push(it(lab + (l.cover ? ' [Cover]' : l.t ? ' [' + l.t.replace(/download|mp3/gi, '').trim() + ']' : ' [MP3]'), l.url, { kind: l.cover ? 'image' : 'audio', thumb: meta.cover || mainThumb })));
+    } else items.push(it(lab + ' [MP3]', '', { kind: 'audio', ext: 'mp3', thumb: meta.cover, lazy: { k: 'mate', m: k, ck, f: fields } }));
   }
-  return path.join(dir, `${name}_${count}${ext}`);
+  if (!items.length) throw new Error('Tautan unduhan tidak ditemukan');
+  return { title: mainTitle || (multi ? 'Koleksi ' + forms.length + ' lagu' : items[0].label), author: '', thumb: mainThumb, items };
 }
 
-export function extractUrls(text) {
-  if (!text || typeof text !== "string") return [];
-  const matches = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
-  return [...new Set(matches)];
-}
-
-export function getHistory(limit = 15) {
-  if (fs.existsSync(HISTORY_PATH)) {
-    try {
-      const list = JSON.parse(fs.readFileSync(HISTORY_PATH, "utf8"));
-      return Array.isArray(list) ? list.slice(0, limit) : [];
-    } catch (_) {}
-  }
-  return [];
-}
-
-export function addToHistory(item) {
-  try {
-    const list = getHistory(100);
-    const record = {
-      url: item.url || "",
-      title: item.title || "Untitled",
-      platform: item.platform || "Unknown",
-      filename: item.filename || "",
-      path: item.path || "",
-      bytes: item.bytes || 0,
-      timestamp: Date.now(),
-    };
-    list.unshift(record);
-    if (!fs.existsSync(CONFIG_DIR)) {
-      fs.mkdirSync(CONFIG_DIR, { recursive: true });
-    }
-    fs.writeFileSync(
-      HISTORY_PATH,
-      JSON.stringify(list.slice(0, 100), null, 2),
-      "utf8",
-    );
-  } catch (_) {}
-}
-
-export function clearHistory() {
-  try {
-    if (fs.existsSync(HISTORY_PATH)) {
-      fs.unlinkSync(HISTORY_PATH);
-    }
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-export function deleteHistoryItems(indices, deleteFile = true) {
-  try {
-    const list = getHistory(200);
-    const sortedIndices = [...new Set(indices)].sort((a, b) => b - a);
-    const deletedItems = [];
-    let filesDeletedCount = 0;
-
-    for (const idx of sortedIndices) {
-      if (idx >= 0 && idx < list.length) {
-        const [removed] = list.splice(idx, 1);
-        let fileDeleted = false;
-        if (deleteFile && removed.path && fs.existsSync(removed.path)) {
-          try {
-            fs.unlinkSync(removed.path);
-            fileDeleted = true;
-            filesDeletedCount++;
-          } catch (_) {}
-        }
-        deletedItems.push({ item: removed, fileDeleted });
-      }
-    }
-
-    fs.writeFileSync(HISTORY_PATH, JSON.stringify(list, null, 2), "utf8");
-
-    return {
-      success: true,
-      count: deletedItems.length,
-      filesDeletedCount,
-      deletedItems,
-    };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
-}
-
-export function deleteHistoryItem(index, deleteFile = true) {
-  const res = deleteHistoryItems([index], deleteFile);
-  if (!res.success) return res;
-  return {
-    success: true,
-    item: res.deletedItems[0]?.item,
-    fileDeleted: res.deletedItems[0]?.fileDeleted || false,
-  };
-}
-
-export function getStats() {
-  const items = getHistory(200);
-  const totalDownloads = items.length;
-  const platformCounts = {};
-  let totalBytes = 0;
-
-  for (const item of items) {
-    const plat = (item.platform || "unknown").toLowerCase();
-    platformCounts[plat] = (platformCounts[plat] || 0) + 1;
-    if (item.bytes && typeof item.bytes === "number") {
-      totalBytes += item.bytes;
-    } else if (item.path && fs.existsSync(item.path)) {
-      try {
-        totalBytes += fs.statSync(item.path).size;
-      } catch (_) {}
-    }
-  }
-
-  let topPlatform = "-";
-  let maxCount = 0;
-  for (const [p, c] of Object.entries(platformCounts)) {
-    if (c > maxCount) {
-      maxCount = c;
-      topPlatform = p;
-    }
-  }
-
-  return {
-    totalDownloads,
-    totalBytes,
-    topPlatform,
-    platformCounts,
-  };
-}
-
-// 3. OTA Hot-Patching Engine (Mori Core + Scrapr Engine)
-const GITHUB_REPO = "coflyn/Mori";
-const OTA_DIR = CONFIG_DIR;
-export const OTA_BUNDLE_PATH = path.join(OTA_DIR, "scrapers-bundle.js");
-export const OTA_META_PATH = path.join(OTA_DIR, "scrapers-meta.json");
-
-export const SCRAPR_DIR = path.join(CONFIG_DIR, "scrapr");
-export const SCRAPR_BUNDLE_PATH = path.join(SCRAPR_DIR, "scrapr-bundle.cjs");
-export const SCRAPR_META_PATH = path.join(SCRAPR_DIR, "version.json");
-export const SCRAPR_VERSION_URL =
-  "https://raw.githubusercontent.com/coflyn/scrapr/main/package.json";
-export const SCRAPR_BUNDLE_URL =
-  "https://raw.githubusercontent.com/coflyn/scrapr/main/bundle.cjs";
-const SCRAPR_FALLBACK_VERSION = "1.3.1";
-
-export function isNewerSemver(latest, current) {
-  if (!latest || !current) return false;
-  const l = String(latest).replace(/^v/, "").split(".").map(Number);
-  const c = String(current).replace(/^v/, "").split(".").map(Number);
-  for (let i = 0; i < 3; i++) {
-    const lPart = l[i] || 0;
-    const cPart = c[i] || 0;
-    if (lPart > cPart) return true;
-    if (lPart < cPart) return false;
-  }
-  return false;
-}
-
-export function resetMori() {
-  const filesToDelete = [
-    CONFIG_PATH,
-    HISTORY_PATH,
-    OTA_BUNDLE_PATH,
-    OTA_META_PATH,
-    SCRAPR_BUNDLE_PATH,
-    SCRAPR_META_PATH,
-  ];
-  for (const f of filesToDelete) {
-    if (fs.existsSync(f)) {
-      try {
-        fs.unlinkSync(f);
-      } catch (_) {}
-    }
-  }
-}
-
-export const OTA_VERSION_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/public/scrapers-version.json`;
-export const OTA_BUNDLE_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/public/js/scrapers/bundle.js`;
-
-export function isMoriInstalled() {
-  return fs.existsSync(OTA_BUNDLE_PATH);
-}
-
-export function isScraprInstalled() {
-  return fs.existsSync(SCRAPR_BUNDLE_PATH);
-}
-
-export function getActiveScraperVersion() {
-  if (fs.existsSync(OTA_META_PATH)) {
-    try {
-      const meta = JSON.parse(fs.readFileSync(OTA_META_PATH, "utf8"));
-      return meta.scraperVersion || null;
-    } catch (_) {}
+/* ---------- YouTube ---------- */
+const ytId = u => (u.match(/(?:youtube\.com\/(?:(?:v|e(?:mbed)?|shorts|live)\/|.*[?&]v=)|youtu\.be\/)([\w-]{11})/i) || [])[1];
+const YH = { Origin: 'https://media.ytmp3.gg', Referer: 'https://media.ytmp3.gg/', 'Content-Type': 'application/json', Accept: 'application/json, text/plain, */*' };
+async function c1s(id, fmt, q) {
+  const r = await http({ url: 'https://hub.convert1s.com/api/download', headers: YH, data: JSON.stringify({ url: 'https://www.youtube.com/watch?v=' + id, os: 'macos', output: { type: fmt === 'mp4' ? 'video' : 'audio', format: fmt, quality: q || (fmt === 'mp4' ? '720p' : '') }, audio: { bitrate: '128k' } }) });
+  let c; try { c = JSON.parse(r.text); } catch (_) { return null; }
+  if (!c || c.error || !c.statusUrl) return null;
+  for (let i = 0; i < 14; i++) {
+    await sleep(1200);
+    let p; try { p = JSON.parse((await http({ url: c.statusUrl, headers: YH })).text); } catch (_) { continue; }
+    if (p.status === 'completed' && p.downloadUrl) return { url: p.downloadUrl, q: c.selectedQuality || q };
+    if (p.status === 'error' || p.status === 'failed') return null;
   }
   return null;
 }
-
-export function getActiveScraprVersion() {
-  if (fs.existsSync(SCRAPR_META_PATH)) {
-    try {
-      const meta = JSON.parse(fs.readFileSync(SCRAPR_META_PATH, "utf8"));
-      return meta.version || null;
-    } catch (_) {}
-  }
+async function ymc(id, fmt) {
+  const h = { Origin: 'https://ytmp3.mobi', Referer: 'https://ytmp3.mobi/en8/', Accept: '*/*' };
+  const j = async u => JSON.parse((await http({ url: u, headers: h })).text);
+  try {
+    const ini = await j('https://a.ymcdn.org/api/v1/init?p=y&23=1llum1n471&_=' + Math.random());
+    if (!ini.convertURL) return null;
+    let c = await j(`${ini.convertURL}&v=${id}&f=${fmt}&_=${Math.random()}`);
+    for (let i = 0; c && c.redirect > 0 && c.redirectURL && i < 5; i++) c = await j(`${c.redirectURL}&v=${id}&f=${fmt}&_=${Math.random()}`);
+    if (!c || c.error) return null;
+    let pr = c.progress || 0, dl = c.downloadURL; const pu = c.progressURL;
+    for (let i = 0; pr < 3 && i < 12 && pu; i++) { await sleep(1200); const d = await j(pu + '&_=' + Math.random()); if (!d || d.error) break; pr = d.progress ?? 0; if (d.downloadURL) dl = d.downloadURL; if (pr === 4) break; }
+    if (dl && (pr >= 3 || dl.includes('/download/'))) { if (dl.startsWith('//')) dl = 'https:' + dl; else if (dl[0] === '/') dl = 'https://ytmp3.mobi' + dl; return { url: dl, q: fmt === 'mp3' ? 'MP3 320k' : 'MP4' }; }
+  } catch (_) {}
   return null;
 }
-
-/**
- * Downloads and installs Mori Core Engine into ~/.mori/
- */
-export async function downloadMoriEngine(onProgress) {
-  if (onProgress) onProgress("Fetching Mori version metadata...");
-  const metaRes = await fetch(OTA_VERSION_URL, {
-    signal: AbortSignal.timeout(10000),
-    headers: { "User-Agent": "Mori-CLI", "Cache-Control": "no-cache" },
-  });
-  if (!metaRes.ok) throw new Error(`Failed to fetch Mori version (HTTP ${metaRes.status})`);
-  const meta = await metaRes.json();
-
-  if (onProgress) onProgress("Downloading Mori Engine bundle (~80 KB)...");
-  const bundleRes = await fetch(OTA_BUNDLE_URL, {
-    signal: AbortSignal.timeout(30000),
-    headers: { "User-Agent": "Mori-CLI", "Cache-Control": "no-cache" },
-  });
-  if (!bundleRes.ok) throw new Error(`Failed to download Mori bundle (HTTP ${bundleRes.status})`);
-  const bundleText = await bundleRes.text();
-  if (!bundleText || bundleText.length < 5000) {
-    throw new Error("Invalid Mori bundle payload received.");
-  }
-
-  if (!fs.existsSync(OTA_DIR)) {
-    fs.mkdirSync(OTA_DIR, { recursive: true });
-  }
-
-  fs.writeFileSync(OTA_BUNDLE_PATH, bundleText, "utf8");
-  fs.writeFileSync(
-    OTA_META_PATH,
-    JSON.stringify(
-      {
-        scraperVersion: meta.scraperVersion || "1.0.0",
-        updatedAt: Date.now(),
-        sourceHash: meta.sourceHash || "",
-        changelog: meta.changelog || "",
-      },
-      null,
-      2,
-    ),
-    "utf8",
-  );
-
-  cachedMoriScrapers = null;
-  return { success: true, version: meta.scraperVersion || "1.0.0" };
+const ytGet = async (id, fmt, q) => (await c1s(id, fmt, q).catch(() => null)) || (q === '360p' ? null : await ymc(id, fmt));
+async function youtube(url) {
+  const id = ytId(url), pl = (url.match(/[?&]list=([^"&?/\s]+)/) || [])[1];
+  if (!id && !pl) throw new Error('Link YouTube tidak valid');
+  if (!id) return ytPlaylist(pl);
+  let title = 'YouTube Video', author = '', thumb = `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+  try { const o = await jget(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${id}&format=json`); title = o.title || title; author = o.author_name || ''; thumb = o.thumbnail_url || thumb; } catch (_) {}
+  const jobs = [['mp4', '720p'], ['mp4', '360p'], ['mp3', '']];
+  const res = await Promise.all(jobs.map(([f, q]) => ytGet(id, f, q).catch(() => null)));
+  const items = [];
+  res.forEach((r, i) => { if (r && r.url) items.push(it(jobs[i][0] === 'mp3' ? 'MP3 128k' : 'MP4 ' + (r.q || jobs[i][1]), r.url, { kind: jobs[i][0] === 'mp3' ? 'audio' : 'video' })); });
+  if (!items.length) throw new Error('Server konversi YouTube tidak merespons');
+  return { title, author, thumb, items: uniq(items, x => x.url) };
 }
-
-/**
- * Downloads and installs Scrapr Engine into ~/.mori/scrapr/
- */
-export async function downloadScraprEngine(onProgress) {
-  if (onProgress) onProgress("Fetching Scrapr metadata...");
-  let version = SCRAPR_FALLBACK_VERSION;
+async function ytPlaylist(pl) {
+  let title = 'YouTube Playlist', thumb = '', vids = [];
   try {
-    const metaRes = await fetch(SCRAPR_VERSION_URL, {
-      signal: AbortSignal.timeout(10000),
-      headers: { "User-Agent": "Mori-CLI", "Cache-Control": "no-cache" },
-    });
-    if (metaRes.ok) {
-      const meta = await metaRes.json();
-      if (meta.version) version = meta.version;
+    const r = await http({ url: 'https://www.youtube.com/playlist?list=' + pl, headers: { 'Accept-Language': 'en-US,en;q=0.9', Cookie: 'SOCS=CAESEwgDEgk2MTc4OTU0NzQaAmVuIAEaBgiA_LyaBg; CONSENT=PENDING+999' } });
+    const m = r.text.match(/ytInitialData\s*=\s*({.+?});<\/script>/s);
+    if (m) {
+      const d = JSON.parse(m[1]);
+      title = (d.metadata && d.metadata.playlistMetadataRenderer && d.metadata.playlistMetadataRenderer.title) || title;
+      const list = (((d.contents || {}).twoColumnBrowseResultsRenderer || {}).tabs || [{}])[0];
+      const sec = (((((list.tabRenderer || {}).content || {}).sectionListRenderer || {}).contents || [{}])[0].itemSectionRenderer || {}).contents;
+      ((sec && sec[0].playlistVideoListRenderer || {}).contents || []).forEach(v => { const p = v.playlistVideoRenderer; if (p && p.videoId) vids.push({ id: p.videoId, t: ((p.title.runs || [])[0] || {}).text || 'Track', c: ((p.shortBylineText || {}).runs || [{}])[0].text || '' }); });
     }
   } catch (_) {}
-
-  if (onProgress) onProgress("Downloading Scrapr Engine bundle (~2.7 MB)...");
-  let bundleText = "";
-
-  // 1. Try remote GitHub raw URL
-  try {
-    const bundleRes = await fetch(SCRAPR_BUNDLE_URL, {
-      signal: AbortSignal.timeout(45000),
-      headers: { "User-Agent": "Mori-CLI", "Cache-Control": "no-cache" },
-    });
-    if (bundleRes.ok) {
-      bundleText = await bundleRes.text();
-    }
-  } catch (_) {}
-
-  // 2. Local fallback during development if remote is not yet pushed
-  if (!bundleText || bundleText.length < 50000) {
-    const localDevScrapr = path.resolve(__dirname, "../../../scrapr/bundle.cjs");
-    if (fs.existsSync(localDevScrapr)) {
-      bundleText = fs.readFileSync(localDevScrapr, "utf8");
-    }
-  }
-
-  if (!bundleText || bundleText.length < 50000) {
-    throw new Error(
-      "Failed to download Scrapr bundle. Ensure bundle.cjs is published or pushed to coflyn/scrapr.",
-    );
-  }
-
-  if (!fs.existsSync(SCRAPR_DIR)) {
-    fs.mkdirSync(SCRAPR_DIR, { recursive: true });
-  }
-
-  fs.writeFileSync(SCRAPR_BUNDLE_PATH, bundleText, "utf8");
-  fs.writeFileSync(
-    SCRAPR_META_PATH,
-    JSON.stringify(
-      {
-        version,
-        updatedAt: Date.now(),
-      },
-      null,
-      2,
-    ),
-    "utf8",
-  );
-
-  cachedScrapr = null;
-  return { success: true, version };
+  if (!vids.length) try { const j = await jget('https://yt-meta.convert1s.com/playlist?id=' + pl, YH); (j.items || []).forEach(v => vids.push({ id: v.id, t: v.title, c: v.channel || '' })); } catch (_) {}
+  if (!vids.length) throw new Error('Playlist kosong / privat');
+  const pad = String(vids.length).length;
+  return { title, author: '', thumb: `https://i.ytimg.com/vi/${vids[0].id}/hqdefault.jpg`, items: vids.map((v, i) => it(String(i + 1).padStart(pad, '0') + '. ' + (v.c ? v.c + ' - ' : '') + v.t + ' [MP3]', '', { kind: 'audio', ext: 'mp3', thumb: `https://i.ytimg.com/vi/${v.id}/mqdefault.jpg`, lazy: { k: 'yt', id: v.id, f: 'mp3' } })) };
 }
 
-export function uninstallMoriEngine() {
-  if (fs.existsSync(OTA_BUNDLE_PATH)) {
-    try { fs.unlinkSync(OTA_BUNDLE_PATH); } catch (_) {}
-  }
-  if (fs.existsSync(OTA_META_PATH)) {
-    try { fs.unlinkSync(OTA_META_PATH); } catch (_) {}
-  }
-  cachedMoriScrapers = null;
-  return true;
+/* ---------- TikTok ---------- */
+const TH = b => ({ 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest', Origin: b, Referer: b + '/id' });
+function tkAnchors(doc, base) {
+  const items = [];
+  doc.querySelectorAll('a[href]').forEach(a => {
+    const h = abs((a.getAttribute('href') || '').replace(/&#38;/g, '&'), base); if (!/^https?:/.test(h) || BAD.test(h)) return;
+    const t = text(a).toLowerCase(), c = a.className || '';
+    if (/mp3|music|audio/.test(t) || /purple/.test(c)) items.push(it('MP3', h, { kind: 'audio' }));
+    else if (/\bhd\b/.test(t)) items.push(it('MP4 HD', h, { kind: 'video' }));
+    else if (/mp4|video|without watermark|download/.test(t) || /download-btn|tik-button-dl/.test(c)) items.push(it('MP4' + (items.some(x => x.kind === 'video') ? ' (mirror)' : ''), h, { kind: 'video' }));
+    else if (/photo|image|foto|jpg/.test(t) || a.closest('.image-item, .photo-list, .images-grid')) items.push(it('Gambar', h, { kind: 'image' }));
+  });
+  doc.querySelectorAll('.image-item img, .photo-list img, .images-grid img').forEach(im => { const s = abs(im.getAttribute('src') || '', base); if (/^https?:/.test(s) && !items.some(x => x.url === s)) items.push(it('Gambar', s, { kind: 'image' })); });
+  let n = 0; items.forEach(x => { if (x.kind === 'image') x.label = 'Gambar ' + (++n); });
+  return uniq(items, x => x.url);
+}
+async function tiktokio(url) {
+  const r = await http({ url: 'https://tiktokio.com/api/v1/tk/html', headers: { 'Content-Type': 'application/json', Origin: 'https://tiktokio.com', Referer: 'https://tiktokio.com/' }, data: { vid: url, prefix: 'tiktokio.com' } });
+  if (!r.text || /Please paste a valid link/.test(r.text)) throw new Error('Link tidak valid');
+  const doc = DOM(r.text), items = tkAnchors(doc, 'https://tiktokio.com');
+  if (!items.length) throw new Error('Tautan tidak ditemukan');
+  const im = doc.querySelector('img');
+  return { title: text(doc.querySelector('h3')) || 'TikTok', author: (url.match(/@([^/]+)/) || [])[1] || '', thumb: im ? im.getAttribute('src').replace(/&#38;/g, '&') : '', items };
+}
+async function tikdl(url) {
+  const r = await http({ url: 'https://tikdownloader.io/api/ajaxSearch', data: 'q=' + encodeURIComponent(url) + '&vt=id', headers: TH('https://tikdownloader.io') });
+  const j = J(r, 'TikDownloader'); if (j.status !== 'ok' || !j.data) throw new Error(j.msg || 'Ekstraksi gagal');
+  const doc = DOM(j.data), items = tkAnchors(doc, 'https://tikdownloader.io');
+  if (!items.length) throw new Error('Tautan tidak ditemukan');
+  return { title: text(doc.querySelector('h3')) || 'TikTok', author: (url.match(/@([^/]+)/) || [])[1] || '', thumb: (doc.querySelector('img') || { getAttribute: () => '' }).getAttribute('src'), items };
+}
+async function tikwm(url) {
+  const j = await jget('https://www.tikwm.com/api/?hd=1&url=' + encodeURIComponent(url), {}, 'TikWM');
+  if (j.code !== 0 || !j.data) throw new Error(j.msg || 'Gagal');
+  const d = j.data, items = [], B = 'https://www.tikwm.com';
+  const A = u => u && (u[0] === '/' ? B + u : u);
+  (d.images || []).forEach((u, i) => items.push(it('Gambar ' + (i + 1), u, { kind: 'image' })));
+  if (d.play) items.push(it('MP4', A(d.play), { kind: 'video' }));
+  if (d.hdplay) items.push(it('MP4 HD', A(d.hdplay), { kind: 'video' }));
+  if (d.music) items.push(it('MP3', A(d.music), { kind: 'audio' }));
+  if (!items.length) throw new Error('Tidak ada media');
+  return { title: d.title || 'TikTok', author: (d.author && d.author.nickname) || '', thumb: A(d.cover) || '', items };
 }
 
-export function uninstallScraprEngine() {
-  if (fs.existsSync(SCRAPR_BUNDLE_PATH)) {
-    try { fs.unlinkSync(SCRAPR_BUNDLE_PATH); } catch (_) {}
-  }
-  if (fs.existsSync(SCRAPR_META_PATH)) {
-    try { fs.unlinkSync(SCRAPR_META_PATH); } catch (_) {}
-  }
-  cachedScrapr = null;
-  return true;
+/* ---------- Instagram ---------- */
+async function igEmbed(url) {
+  const sc = (url.match(/(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/) || [])[1]; if (!sc) throw new Error('Shortcode tidak ada');
+  const r = await http({ url: `https://www.instagram.com/p/${sc}/embed/captioned/`, headers: { 'User-Agent': IUA } });
+  const u = r.text.replace(/\\"/g, '"').replace(/\\\\/g, '\\'), i = u.indexOf('"shortcode_media":'); if (i < 0) throw new Error('Embed kosong');
+  let d = 0, e = -1; const s = i + 18;
+  for (let k = s; k < u.length; k++) { const c = u[k]; if (c === '{') d++; else if (c === '}' && --d === 0) { e = k + 1; break; } }
+  if (e < 0) throw new Error('Embed rusak');
+  const m = JSON.parse(u.slice(s, e)), cap = ((m.edge_media_to_caption || {}).edges || [{}])[0], items = [];
+  const nodes = m.edge_sidecar_to_children ? m.edge_sidecar_to_children.edges.map(x => x.node) : [m];
+  nodes.forEach((n, i) => { const mu = n.video_url || n.display_url; if (mu) items.push(it((n.is_video ? 'Video ' : 'Foto ') + (nodes.length > 1 ? i + 1 : 'HD'), mu, { kind: n.is_video ? 'video' : 'image', thumb: n.display_url })); });
+  if (!items.length) throw new Error('Media tidak ada');
+  return { title: ((cap.node || {}).text || 'Instagram').slice(0, 100), author: (m.owner && m.owner.username) || '', thumb: items[0].thumb || items[0].url, items };
+}
+async function indown(url) {
+  const r = await http({ url: 'https://indown.net/api/ajaxSearch', data: 'q=' + encodeURIComponent(url) + '&t=media&lang=id', headers: TH('https://indown.net') });
+  const j = J(r, 'Indown'); if (j.status !== 'ok' || !j.data) throw new Error('Gagal');
+  const items = tkAnchors(DOM(j.data), 'https://indown.net').map((x, i) => Object.assign(x, { label: x.kind === 'image' ? 'Foto ' + (i + 1) : 'Video' }));
+  if (!items.length) throw new Error('Tautan tidak ditemukan');
+  return { title: 'Instagram', author: '', thumb: items[0].kind === 'image' ? items[0].url : '', items };
 }
 
-export async function fetchMoriEngineHistory() {
-  try {
-    const res = await fetch(
-      `https://api.github.com/repos/${GITHUB_REPO}/commits?path=public/js/scrapers/bundle.js&per_page=15`,
-      {
-        signal: AbortSignal.timeout(10000),
-        headers: { "User-Agent": "Mori-CLI" },
-      },
-    );
-    if (!res.ok) return [];
-    const commits = await res.json();
-    if (!Array.isArray(commits)) return [];
-    return commits.map((c) => ({
-      sha: c.sha.slice(0, 7),
-      fullSha: c.sha,
-      message: (c.commit?.message || "").split("\n")[0].trim(),
-      date: c.commit?.author?.date || "",
-    }));
-  } catch (_) {
-    return [];
-  }
+/* ---------- X / Twitter ---------- */
+async function fxt(url) {
+  const id = (url.match(/status(?:es)?\/(\d+)/) || [])[1]; if (!id) throw new Error('Link tweet tidak valid');
+  const j = await jget('https://api.fxtwitter.com/status/' + id, {}, 'FxTwitter');
+  if (j.code !== 200 || !j.tweet) throw new Error(j.message || 'Tweet tidak ditemukan');
+  const t = j.tweet, au = (t.author && (t.author.name || t.author.screen_name)) || 'X', items = [], md = t.media || {};
+  (md.videos || []).forEach(v => items.push(it('MP4 ' + (v.width ? v.width + 'x' + v.height : 'HD'), v.url, { kind: 'video' })));
+  (md.photos || []).forEach((p, i) => items.push(it('Foto ' + (i + 1), p.url, { kind: 'image' })));
+  if (!items.length) (md.all || []).forEach((m, i) => items.push(it((m.type === 'photo' ? 'Foto ' : 'Media ') + (i + 1), m.url, { kind: m.type === 'photo' ? 'image' : 'video' })));
+  if (!items.length) throw new Error('Tidak ada media di tweet ini');
+  return { title: (t.text || '').replace(/https:\/\/t\.co\/\S+/g, '').trim().slice(0, 90) || au + ' tweet', author: au + (t.author && t.author.screen_name ? ' (@' + t.author.screen_name + ')' : ''), thumb: (md.videos && md.videos[0] && md.videos[0].thumbnail_url) || (md.photos && md.photos[0] && md.photos[0].url) || '', items };
+}
+async function vxt(url) {
+  const id = (url.match(/status(?:es)?\/(\d+)/) || [])[1]; if (!id) throw new Error('Link tweet tidak valid');
+  const j = await jget('https://api.vxtwitter.com/Twitter/status/' + id, {}, 'VxTwitter');
+  const items = (j.media_extended || []).map((m, i) => it((m.type === 'image' ? 'Foto ' : 'MP4 ') + (i + 1), m.url, { kind: m.type === 'image' ? 'image' : 'video' }));
+  if (!items.length) throw new Error('Tidak ada media');
+  return { title: (j.text || 'Tweet').slice(0, 90), author: j.user_name || '', thumb: (j.media_extended[0] || {}).thumbnail_url || '', items };
 }
 
-export async function downloadMoriEngineByCommit(commitSha, onProgress) {
-  const shortSha = commitSha.slice(0, 7);
-  if (onProgress) onProgress(`Fetching Mori Core bundle at commit ${shortSha}...`);
-
-  const bundleUrl = `https://raw.githubusercontent.com/${GITHUB_REPO}/${commitSha}/public/js/scrapers/bundle.js`;
-  const metaUrl = `https://raw.githubusercontent.com/${GITHUB_REPO}/${commitSha}/public/scrapers-version.json`;
-
-  const [bundleRes, metaRes] = await Promise.all([
-    fetch(bundleUrl, {
-      signal: AbortSignal.timeout(30000),
-      headers: { "User-Agent": "Mori-CLI", "Cache-Control": "no-cache" },
-    }),
-    fetch(metaUrl, {
-      signal: AbortSignal.timeout(15000),
-      headers: { "User-Agent": "Mori-CLI", "Cache-Control": "no-cache" },
-    }).catch(() => null),
-  ]);
-
-  if (!bundleRes.ok) {
-    throw new Error(`Failed to fetch bundle at commit ${shortSha}: HTTP ${bundleRes.status}`);
-  }
-
-  const bundleText = await bundleRes.text();
-  if (!bundleText || bundleText.length < 5000) {
-    throw new Error("Downloaded bundle is empty or invalid.");
-  }
-
-  let meta = { scraperVersion: shortSha };
-  if (metaRes && metaRes.ok) {
-    try {
-      meta = await metaRes.json();
-    } catch (_) {}
-  }
-
-  if (!fs.existsSync(OTA_DIR)) {
-    fs.mkdirSync(OTA_DIR, { recursive: true });
-  }
-
-  fs.writeFileSync(OTA_BUNDLE_PATH, bundleText, "utf8");
-  fs.writeFileSync(
-    OTA_META_PATH,
-    JSON.stringify(
-      {
-        scraperVersion: meta.scraperVersion || shortSha,
-        updatedAt: Date.now(),
-        sourceHash: meta.sourceHash || "",
-        changelog: meta.changelog || "",
-        commitSha: shortSha,
-      },
-      null,
-      2,
-    ),
-    "utf8",
-  );
-
-  cachedMoriScrapers = null;
-  return { success: true, version: meta.scraperVersion || shortSha };
+/* ---------- Lainnya ---------- */
+async function facebook(url) { const r = await snapsave(url, 'id'); r.title = 'Facebook'; return r; }
+async function igSnap(url) { const r = await snapsave(url, ''); r.title = 'Instagram'; return r; }
+async function threads(url) {
+  let u = url;
+  if (/\/share\//.test(u)) try { u = (await http({ url: u, headers: { 'User-Agent': DUA } })).url || u; } catch (_) {}
+  u = u.replace(/threads\.com/i, 'threads.net');
+  const home = await http({ url: 'https://threadster.app/' });
+  const r = await http({ url: 'https://threadster.app/download', data: form({ url: u }), headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: home.ck, Origin: 'https://threadster.app', Referer: 'https://threadster.app/' } });
+  const doc = DOM(r.text), items = [];
+  anchors(doc, 'https://threadster.app').forEach(a => {
+    if (!/token=|acxcdn\.com/.test(a.h)) return;
+    let f = a.h, k = 'video';
+    try { const tk = new URL(a.h).searchParams.get('token'); if (tk) { const p = b64j(tk.split('.')[1]); if (p.url) { f = p.url; if (/\.(jpe?g|png|webp)/i.test(f)) k = 'image'; } } } catch (_) {}
+    items.push(it((k === 'image' ? 'Foto ' : 'Video ') + (items.length + 1), f, { kind: k, thumb: f }));
+  });
+  if (!items.length) throw new Error('Tautan tidak ditemukan');
+  return { title: text(doc.querySelector('.card-title, .video-title, h1, h2, h3, p')) || 'Threads', author: '', thumb: items[0].kind === 'image' ? items[0].url : '', items: uniq(items, x => x.url) };
 }
-
-export async function fetchScraprEngineVersions() {
-  try {
-    const res = await fetch("https://registry.npmjs.org/@coflyn/scrapr", {
-      signal: AbortSignal.timeout(10000),
-      headers: { "User-Agent": "Mori-CLI" },
-    });
-    if (!res.ok) return [];
-    const data = await res.json();
-    const versions = Object.keys(data.versions || {});
-    return versions.reverse();
-  } catch (_) {
-    return [];
-  }
+async function pinterest(url) {
+  let u = url;
+  if (/pin\.it/.test(u)) try { const h = (await http({ url: u })).text; const c = h.match(/<link[^>]+rel="canonical"[^>]+href="([^"]+)"/i); if (c) u = c[1]; } catch (_) {}
+  const r = await http({ url: u, headers: { Accept: 'text/html,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.5' } }), h = r.text;
+  const og = h.match(/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i) || h.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:title"/i);
+  const vids = uniq(h.match(/https:\/\/[^"'\s\\]+\.mp4[^\s"'\\]*/gi) || [], x => x);
+  let imgs = h.match(/https:\/\/i\.pinimg\.com\/originals\/[a-zA-Z0-9/._-]+\.(?:jpg|jpeg|png|webp)/gi) || h.match(/https:\/\/i\.pinimg\.com\/736x\/[a-zA-Z0-9/._-]+\.(?:jpg|jpeg|png|webp)/gi) || [];
+  imgs = uniq(imgs, x => x).filter(x => !/avatars|profile|sprite|placeholder|d53b014d86a6b6761bf649a0ed813c2b/.test(x));
+  const items = vids.slice(0, 3).map((v, i) => it('Video ' + (i + 1), v, { kind: 'video' })).concat(imgs.slice(0, 6).map((v, i) => it('Gambar ' + (i + 1), v, { kind: 'image' })));
+  if (!items.length) throw new Error('Pin tidak berisi media');
+  return { title: og ? og[1].replace(/ \| Pinterest$/i, '') : 'Pinterest', author: '', thumb: imgs[0] || '', items };
 }
-
-export async function downloadScraprEngineVersion(targetVersion, onProgress) {
-  if (onProgress) onProgress(`Downloading Scrapr Engine v${targetVersion}...`);
-  let bundleText = "";
-
-  const urls = [
-    `https://unpkg.com/@coflyn/scrapr@${targetVersion}/bundle.cjs`,
-    `https://cdn.jsdelivr.net/npm/@coflyn/scrapr@${targetVersion}/bundle.cjs`,
-    `https://raw.githubusercontent.com/coflyn/scrapr/v${targetVersion}/bundle.cjs`,
-    `https://raw.githubusercontent.com/coflyn/scrapr/main/bundle.cjs`,
-  ];
-
-  for (const u of urls) {
-    try {
-      const res = await fetch(u, {
-        signal: AbortSignal.timeout(30000),
-        headers: { "User-Agent": "Mori-CLI", "Cache-Control": "no-cache" },
-      });
-      if (res.ok) {
-        bundleText = await res.text();
-        if (bundleText && bundleText.length > 50000) break;
-      }
-    } catch (_) {}
-  }
-
-  if (!bundleText || bundleText.length < 50000) {
-    const localDevScrapr = path.resolve(__dirname, "../../../scrapr/bundle.cjs");
-    if (fs.existsSync(localDevScrapr)) {
-      bundleText = fs.readFileSync(localDevScrapr, "utf8");
-    }
-  }
-
-  if (!bundleText || bundleText.length < 50000) {
-    throw new Error(`Failed to download Scrapr v${targetVersion} bundle.`);
-  }
-
-  if (!fs.existsSync(SCRAPR_DIR)) {
-    fs.mkdirSync(SCRAPR_DIR, { recursive: true });
-  }
-
-  fs.writeFileSync(SCRAPR_BUNDLE_PATH, bundleText, "utf8");
-  fs.writeFileSync(
-    SCRAPR_META_PATH,
-    JSON.stringify(
-      {
-        version: targetVersion,
-        updatedAt: Date.now(),
-      },
-      null,
-      2,
-    ),
-    "utf8",
-  );
-
-  cachedScrapr = null;
-  return { success: true, version: targetVersion };
-}
-
-/**
- * Checks for Mori Core OTA updates from GitHub raw.
- */
-export async function checkForOtaUpdate(force = false) {
-  if (!isMoriInstalled()) {
-    return { updated: false, notInstalled: true };
-  }
-  try {
-    const metaRes = await fetch(OTA_VERSION_URL, {
-      signal: AbortSignal.timeout(force ? 8000 : 2500),
-      headers: { "User-Agent": "Mori-CLI-OTA", "Cache-Control": "no-cache" },
-    });
-    if (!metaRes.ok) return { updated: false, reason: "Fetch error" };
-
-    const remoteMeta = await metaRes.json();
-    const currentVer = getActiveScraperVersion();
-
-    if (remoteMeta.scraperVersion && remoteMeta.scraperVersion > currentVer) {
-      const bundleRes = await fetch(OTA_BUNDLE_URL, {
-        signal: AbortSignal.timeout(15000),
-        headers: { "User-Agent": "Mori-CLI-OTA", "Cache-Control": "no-cache" },
-      });
-      if (!bundleRes.ok)
-        return { updated: false, reason: "Bundle download error" };
-
-      const bundleText = await bundleRes.text();
-      if (!bundleText || bundleText.length < 5000) {
-        return { updated: false, reason: "Invalid bundle payload" };
-      }
-
-      if (!fs.existsSync(OTA_DIR)) {
-        fs.mkdirSync(OTA_DIR, { recursive: true });
-      }
-
-      fs.writeFileSync(OTA_BUNDLE_PATH, bundleText, "utf8");
-      fs.writeFileSync(
-        OTA_META_PATH,
-        JSON.stringify(
-          {
-            scraperVersion: remoteMeta.scraperVersion,
-            updatedAt: Date.now(),
-            sourceHash: remoteMeta.sourceHash || "",
-            changelog: remoteMeta.changelog || "",
-          },
-          null,
-          2,
-        ),
-        "utf8",
-      );
-
-      cachedMoriScrapers = null;
-
-      return {
-        updated: true,
-        oldVersion: currentVer,
-        newVersion: remoteMeta.scraperVersion,
-        changelog: remoteMeta.changelog || "",
-      };
-    }
-
-    return { updated: false, currentVersion: currentVer, latest: true };
-  } catch (err) {
-    if (force) throw err;
-    return { updated: false, error: err.message };
-  }
-}
-
-/**
- * Checks for Scrapr Engine OTA updates from GitHub raw.
- */
-export async function checkForScraprOtaUpdate(force = false) {
-  if (!isScraprInstalled()) {
-    return { updated: false, notInstalled: true };
-  }
-  try {
-    const metaRes = await fetch(SCRAPR_VERSION_URL, {
-      signal: AbortSignal.timeout(force ? 8000 : 2500),
-      headers: { "User-Agent": "Mori-CLI-OTA", "Cache-Control": "no-cache" },
-    });
-    if (!metaRes.ok) return { updated: false, reason: "Fetch error" };
-
-    const remoteMeta = await metaRes.json();
-    const currentVer = getActiveScraprVersion();
-
-    if (remoteMeta.version && isNewerSemver(remoteMeta.version, currentVer)) {
-      const bundleRes = await fetch(SCRAPR_BUNDLE_URL, {
-        signal: AbortSignal.timeout(30000),
-        headers: { "User-Agent": "Mori-CLI-OTA", "Cache-Control": "no-cache" },
-      });
-      if (!bundleRes.ok)
-        return { updated: false, reason: "Scrapr bundle download error" };
-
-      const bundleText = await bundleRes.text();
-      if (!bundleText || bundleText.length < 50000) {
-        return { updated: false, reason: "Invalid Scrapr bundle payload" };
-      }
-
-      if (!fs.existsSync(SCRAPR_DIR)) {
-        fs.mkdirSync(SCRAPR_DIR, { recursive: true });
-      }
-
-      fs.writeFileSync(SCRAPR_BUNDLE_PATH, bundleText, "utf8");
-      fs.writeFileSync(
-        SCRAPR_META_PATH,
-        JSON.stringify(
-          {
-            version: remoteMeta.version,
-            updatedAt: Date.now(),
-          },
-          null,
-          2,
-        ),
-        "utf8",
-      );
-
-      cachedScrapr = null;
-
-      return {
-        updated: true,
-        oldVersion: currentVer,
-        newVersion: remoteMeta.version,
-      };
-    }
-
-    return { updated: false, currentVersion: currentVer, latest: true };
-  } catch (err) {
-    if (force) throw err;
-    return { updated: false, error: err.message };
-  }
-}
-
-// 3. Load Scraper Core (Mori Engine)
-let cachedMoriScrapers = null;
-
-export function loadScraperEngine() {
-  if (cachedMoriScrapers) return cachedMoriScrapers;
-
-  const localBundlePath = path.join(__dirname, "bundle.js");
-  const rootBundlePath = path.join(ROOT_DIR, "public/js/scrapers/bundle.js");
-
-  // Priority 1: ~/.mori/scrapers-bundle.js
-  if (fs.existsSync(OTA_BUNDLE_PATH)) {
-    try {
-      const patchCode = fs.readFileSync(OTA_BUNDLE_PATH, "utf8");
-      (0, eval)(patchCode);
-      if (globalThis.__MoriCoreScrapers) {
-        cachedMoriScrapers = globalThis.__MoriCoreScrapers;
-        return cachedMoriScrapers;
-      }
-    } catch (_) {
+async function bilibili(url) {
+  let u = url;
+  if (/b23\.tv|bili\.im/.test(u)) try { u = (await http({ url: u })).url || u; } catch (_) {}
+  const bv = (u.match(/(BV[a-zA-Z0-9]{10})/i) || [])[1];
+  if (bv) {
+    const H = { Referer: 'https://www.bilibili.com/video/' + bv };
+    const pl = await jget('https://api.bilibili.com/x/player/pagelist?bvid=' + bv, H, 'Bilibili');
+    let title = 'Bilibili', thumb = '';
+    try { const h = (await http({ url: 'https://www.bilibili.com/video/' + bv })).text; const a = h.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)/i), b = h.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)/i); if (a) title = a[1].replace(/_哔哩哔哩_bilibili.*$/i, '').trim(); if (b) thumb = b[1]; } catch (_) {}
+    if (pl.code !== 0 || !pl.data || !pl.data.length) throw new Error('Video tidak ditemukan');
+    const items = [];
+    for (let i = 0; i < Math.min(pl.data.length, 30); i++) {
+      const p = pl.data[i];
       try {
-        fs.unlinkSync(OTA_BUNDLE_PATH);
-        if (fs.existsSync(OTA_META_PATH)) fs.unlinkSync(OTA_META_PATH);
+        const d = await jget(`https://api.bilibili.com/x/player/playurl?bvid=${bv}&cid=${p.cid}&qn=64&fnval=0`, H, 'Bilibili');
+        ((d.data || {}).durl || []).forEach(x => x.url && items.push(it((pl.data.length > 1 ? (p.part || 'Part ' + (i + 1)) + ' ' : '') + '720p', x.url.replace(/^http:/, 'https:'), { kind: 'video', h: { Referer: 'https://www.bilibili.com/' } })));
       } catch (_) {}
     }
+    if (!items.length) throw new Error('Tautan video tidak tersedia (mungkin butuh login)');
+    return { title, author: '', thumb, items };
   }
-
-  // Priority 2: Dev path fallback
-  const devPath = fs.existsSync(localBundlePath)
-    ? localBundlePath
-    : fs.existsSync(rootBundlePath)
-      ? rootBundlePath
-      : null;
-
-  if (devPath) {
-    try {
-      const bundleCode = fs.readFileSync(devPath, "utf8");
-      (0, eval)(bundleCode);
-      if (globalThis.__MoriCoreScrapers) {
-        cachedMoriScrapers = globalThis.__MoriCoreScrapers;
-        return cachedMoriScrapers;
-      }
-    } catch (_) {}
-  }
-
-  throw new Error("Mori Engine not installed. Use /engine to install.");
+  const aid = (u.match(/video\/(\d+)/) || u.match(/play\/(?:\d+\/)?(\d+)/) || [])[1];
+  if (!aid) throw new Error('Link Bilibili tidak dikenali');
+  const d = await jget(`https://api.bilibili.tv/intl/gateway/web/v2/playurl?aid=${aid}&platform=web&s_locale=en_US`, {}, 'Bilibili.tv');
+  const pu = (d.data || {}).playurl || {}, items = [];
+  (pu.video || pu.durl || []).forEach(v => { let x = v.url || v.base_url || (v.video_resource && v.video_resource.url); if (x) items.push(it((v.quality || (v.stream_info && v.stream_info.desc_words) || 'HD') + (/^\d+$/.test(v.quality) ? 'p' : ''), x.replace(/^http:/, 'https:'), { kind: 'video', h: { Referer: 'https://www.bilibili.tv/' } })); });
+  if (!items.length) throw new Error('Tautan video tidak tersedia');
+  return { title: 'Bilibili', author: '', thumb: '', items };
 }
-
-// 3b. Load Scrapr Engine (Engine 2)
-let cachedScrapr = null;
-
-export function loadScraprEngine() {
-  if (cachedScrapr) return cachedScrapr;
-
-  const localBundlePath = path.join(__dirname, "scrapr-bundle.cjs");
-  const devScraprPath = path.resolve(__dirname, "../../../scrapr/bundle.cjs");
-
-  // Priority 1: ~/.mori/scrapr/scrapr-bundle.cjs
-  if (fs.existsSync(SCRAPR_BUNDLE_PATH)) {
-    try {
-      cachedScrapr = require(SCRAPR_BUNDLE_PATH);
-      if (cachedScrapr && cachedScrapr.resolver) {
-        return cachedScrapr;
-      }
-    } catch (_) {
-      try {
-        fs.unlinkSync(SCRAPR_BUNDLE_PATH);
-        if (fs.existsSync(SCRAPR_META_PATH)) fs.unlinkSync(SCRAPR_META_PATH);
-      } catch (_) {}
+async function pixiv(url) {
+  const id = (url.match(/artworks\/(\d+)/) || url.match(/illust_id=(\d+)/) || url.match(/\/i\/(\d+)/) || [])[1]; if (!id) throw new Error('ID karya tidak ditemukan');
+  const H = { Referer: 'https://www.pixiv.net/' }; let d = null;
+  try { const j = await jget(`https://www.pixiv.net/ajax/illust/${id}?lang=en`, H, 'Pixiv'); if (!j.error) d = j.body; } catch (_) {}
+  const items = [];
+  if (d) {
+    if (d.illustType === 2) { try { const u = (await jget(`https://www.pixiv.net/ajax/illust/${id}/ugoira_meta?lang=en`, H)).body; items.push(it('Ugoira (ZIP)', u.originalSrc, { kind: 'file', ext: 'zip', h: H })); } catch (_) {} }
+    else if (d.pageCount > 1) { try { (await jget(`https://www.pixiv.net/ajax/illust/${id}/pages?lang=en`, H)).body.forEach((p, i) => items.push(it('Halaman ' + (i + 1), p.urls.original, { kind: 'image', h: H, thumb: p.urls.small }))); } catch (_) {} }
+    else if (d.urls && d.urls.original) items.push(it('Gambar Original', d.urls.original, { kind: 'image', h: H }));
+  }
+  if (!items.length) { items.push(it('Gambar (mirror)', `https://pixiv.re/${id}.jpg`, { kind: 'image' })); }
+  return { title: (d && d.title) || 'Pixiv #' + id, author: (d && d.userName) || '', thumb: (d && d.urls && d.urls.regular) ? d.urls.regular : '', thumbH: H, items };
+}
+async function douyin(url) {
+  const r = await http({ url, headers: { 'User-Agent': IUA } }), u = r.url || url;
+  const id = (u.match(/(?:video|note|slides)\/(\d+)/) || u.match(/modal_id=(\d+)/) || r.text.match(/video\/(\d{15,})/) || [])[1];
+  if (!id) throw new Error('ID Douyin tidak ditemukan');
+  const d = await jget('https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids=' + id, { 'User-Agent': IUA, Accept: 'application/json' }, 'Douyin');
+  const x = d.item_list && d.item_list[0]; if (!x) throw new Error('Konten tidak ditemukan');
+  const items = [];
+  if (x.images && x.images.length) x.images.forEach((m, i) => { const s = (m.url_list || m.download_url_list || [])[0]; if (s) items.push(it('Foto ' + (i + 1), s.replace(/^http:/, 'https:'), { kind: 'image' })); });
+  else {
+    let w = ((x.video.play_addr || {}).url_list || (x.video.download_addr || {}).url_list || [])[0]; if (!w) throw new Error('Video tidak ada');
+    w = w.replace(/^http:/, 'https:').replace('playwm', 'play'); const v = (w.match(/video_id=([^&]+)/) || [])[1];
+    items.push(it('MP4 (tanpa watermark)', v ? 'https://aweme.snssdk.com/aweme/v1/play/?video_id=' + v : w, { kind: 'video' }));
+    const mu = x.music && x.music.play_url && x.music.play_url.url_list && x.music.play_url.url_list[0]; if (mu) items.push(it('MP3 (musik)', mu, { kind: 'audio' }));
+  }
+  return { title: x.desc || 'Douyin', author: (x.author && x.author.nickname) || '', thumb: ((x.video || {}).cover || {}).url_list ? x.video.cover.url_list[0] : '', items };
+}
+async function rednote(url) {
+  let r = await http({ url, headers: { 'User-Agent': UA } }), u = r.url || url, h = r.text;
+  const id = (u.match(/(?:explore|discovery\/item|item)\/([0-9a-f]{24})/i) || h.match(/\/explore\/([0-9a-f]{24})/i) || [])[1];
+  if (!/__INITIAL_STATE__/.test(h) && id) h = (await http({ url: 'https://www.xiaohongshu.com/explore/' + id, headers: { 'User-Agent': UA } })).text;
+  const items = []; let title = '', author = '', thumb = '';
+  const m = h.match(/__INITIAL_STATE__\s*=\s*({[\s\S]*?})\s*<\/script>/);
+  if (m) try {
+    const st = JSON.parse(m[1].replace(/\bundefined\b/g, 'null')), map = (st.note || {}).noteDetailMap || {};
+    const n = (map[id] || map[Object.keys(map)[0]] || {}).note || (st.noteData && st.noteData.data && st.noteData.data.noteData);
+    if (n) {
+      title = n.title || n.desc || ''; author = (n.user || {}).nickname || '';
+      (n.imageList || []).forEach((im, i) => { const s = im.urlDefault || im.url || (im.infoList || [])[0] && im.infoList[0].url; if (s) { if (!thumb) thumb = s; items.push(it('Foto ' + (i + 1), s.replace(/^http:/, 'https:'), { kind: 'image', ext: 'jpg' })); } });
+      const st2 = (((n.video || {}).media || {}).stream) || {};
+      [].concat(st2.h264 || [], st2.h265 || [], st2.av1 || []).slice(0, 3).forEach((v, i) => v.masterUrl && items.push(it('MP4 ' + (v.height ? v.height + 'p' : 'HD'), v.masterUrl.replace(/^http:/, 'https:'), { kind: 'video' })));
+      const ok = ((n.video || {}).consumer || {}).originVideoKey; if (!items.some(x => x.kind === 'video') && ok) items.push(it('MP4 Original', 'https://sns-video-bd.xhscdn.com/' + ok, { kind: 'video' }));
     }
-  }
-
-  // Priority 2: Dev path fallback
-  const fallback = fs.existsSync(localBundlePath)
-    ? localBundlePath
-    : fs.existsSync(devScraprPath)
-      ? devScraprPath
-      : null;
-
-  if (fallback) {
-    try {
-      cachedScrapr = require(fallback);
-      if (cachedScrapr && cachedScrapr.resolver) {
-        return cachedScrapr;
-      }
-    } catch (_) {}
-  }
-
-  throw new Error("Scrapr Engine not installed. Use /engine to install.");
-}
-
-function getScraperFetch() {
-  try {
-    const s = loadScraperEngine();
-    if (s?.scraperFetch) return s.scraperFetch;
   } catch (_) {}
-  return async function (opts) {
-    const res = await fetch(opts.url, {
-      method: opts.method || (opts.data ? "POST" : "GET"),
-      headers: opts.headers || {},
-      body: typeof opts.data === "object" ? JSON.stringify(opts.data) : opts.data,
-    });
-    const text = await res.text();
-    return opts.rawResponse
-      ? {
-          status: res.status,
-          headers: Object.fromEntries(res.headers.entries()),
-          data: text,
-          url: res.url,
-        }
-      : text;
-  };
+  if (!items.length) {
+    const og = p => (h.match(new RegExp('<meta[^>]+(?:property|name)="' + p + '"[^>]+content="([^"]+)"', 'i')) || [])[1];
+    const v = og('og:video'), im = h.match(/<meta[^>]+name="og:image"[^>]+content="([^"]+)"/gi);
+    if (v) items.push(it('MP4', v, { kind: 'video' }));
+    (im || []).forEach((t, i) => items.push(it('Foto ' + (i + 1), (t.match(/content="([^"]+)"/) || [])[1], { kind: 'image' })));
+    title = og('og:title') || title;
+  }
+  if (!items.length) throw new Error('Media catatan tidak ditemukan (butuh xsec_token di link)');
+  return { title: (title || 'RedNote').slice(0, 100), author, thumb: thumb || (items[0].kind === 'image' ? items[0].url : ''), items: uniq(items, x => x.url) };
+}
+async function shopee(url) {
+  const D = { 'User-Agent': DUA, 'Accept-Language': 'en-US,en;q=0.9' };
+  const home = await http({ url: 'https://svxtract.com/', headers: D });
+  const m = home.text.match(/encodeURIComponent\(["']([a-f0-9]{32,64})["']\)/i) || home.text.match(/csrf_token["']?\s*:\s*["']([^"']+)["']/i) || home.text.match(/csrf_token=([^&"'\s]+)/i);
+  if (!m) throw new Error('Token svxtract tidak ditemukan');
+  const j = await jget(`https://svxtract.com/apiv3.php?url=${encodeURIComponent(url)}&csrf_token=${encodeURIComponent(m[1])}`, Object.assign({ Referer: 'https://svxtract.com/', Origin: 'https://svxtract.com', Cookie: home.ck, Accept: 'application/json, text/javascript, */*; q=0.01', 'X-Requested-With': 'XMLHttpRequest' }, D), 'SVXtract');
+  const items = [];
+  Object.keys(j.stream || {}).forEach(k => { const v = j.stream[k], s = typeof v === 'object' ? v.stream : v; if (s && /^https?:/.test(s)) items.push(it(k + ' (tanpa watermark)', s, { kind: 'video', ext: 'mp4', h: { Referer: 'https://svxtract.com/', 'User-Agent': DUA } })); });
+  if (!items.length) throw new Error('Video Shopee tidak ditemukan');
+  return { title: (j.username || 'Shopee') + ' di Shopee Video', author: j.username || '', thumb: j.preview || '', items };
+}
+async function soundcloud(url) {
+  let meta = {}; try { meta = await jget('https://soundcloud.com/oembed?format=json&url=' + encodeURIComponent(url)); } catch (_) {}
+  const B = 'https://www.forhub.io', home = B + '/soundcloud/en18/';
+  const tk = (await jget(B + '/csrf-token-endpoint.php', { Referer: home, Accept: 'application/json' }, 'Forhub')).csrf_token;
+  if (!tk) throw new Error('Token Forhub tidak ada');
+  const r = await http({ url: B + '/download.php', data: form({ formurl: url, value: url, csrf_token: tk }), headers: { Referer: home, Origin: B, 'Content-Type': 'application/x-www-form-urlencoded' } });
+  const at = (r.text.match(/const\s+FORHUB_API_TOKEN\s*=\s*["']([^"']+)["']/) || [])[1];
+  if (!at) throw new Error(text(DOM(r.text).querySelector('.alert')) || 'Forhub menolak link ini');
+  const H = { 'X-Forhub-Api-Token': at, Accept: 'application/json, text/plain, */*', Referer: B + '/download.php', Origin: B };
+  let q = await http({ url: `https://dl.forhub.io/?url=${encodeURIComponent(url)}&async=1`, headers: H }), d; try { d = JSON.parse(q.text); } catch (_) { d = {}; }
+  for (let i = 0; i < 15 && (q.status === 202 || d.pending) && d.pollToken; i++) {
+    await sleep(2000);
+    q = await http({ url: 'https://dl.forhub.io/status', data: JSON.stringify({ token: d.pollToken }), headers: Object.assign({ 'Content-Type': 'application/json' }, H) });
+    try { d = JSON.parse(q.text); } catch (_) { d = {}; }
+  }
+  if (!d.downloadUrl) throw new Error(d.error || d.message || 'Konversi SoundCloud gagal');
+  return { title: meta.title || 'SoundCloud', author: meta.author_name || '', thumb: meta.thumbnail_url || '', items: [it('MP3 128kbps', d.downloadUrl, { kind: 'audio', h: { Referer: B + '/download.php', 'User-Agent': UA } })] };
 }
 
-// 4. Platform Detection
-export const SCRAPR_ONLY_PLATFORMS = new Set([
-  "soundcloud",
-  "mediafire",
-  "sfile",
-  "pixeldrain",
-  "catbox",
-  "krakenfiles",
-  "gdrive",
-  "doodstream",
-  "safelinku",
-  "sub2unlock",
-  "rekonise",
-  "unshorten",
-  // Comic & Manga (Engine 2)
-  "kiryuu",
-  "komikcast",
-  "mangadex",
-  "komikindo",
-  "komiku",
-  "bacakomik",
-  "manhwaindo",
-  "asurascans",
-  "mangabats",
-  // Anime (Engine 2)
-  "otakudesu",
-  "nimegami",
-  "gogoanime",
-  "animetosho",
-]);
-
-export const RESOLVER_LINK_PLATFORMS = new Set([
-  "catbox",
-  "pixeldrain",
-  "safelinku",
-  "sfile",
-  "mediafire",
-  "krakenfiles",
-  "gdrive",
-  "sub2unlock",
-  "rekonise",
-  "unshorten",
-]);
-
-export const SHORTLINK_PLATFORMS = new Set([
-  "safelinku",
-  "sub2unlock",
-  "rekonise",
-  "unshorten",
-]);
-
-export function detectPlatform(rawUrl) {
-  if (!rawUrl || typeof rawUrl !== "string") return null;
-  const url = rawUrl.toLowerCase();
-  if (url.includes("tiktok.com") || url.includes("tt.site")) return "tiktok";
-  if (url.includes("instagram.com")) return "instagram";
-  if (url.includes("youtube.com") || url.includes("youtu.be")) return "youtube";
-  if (
-    url.includes("twitter.com") ||
-    /(?:^|[/.])x\.com(?:[/?#:]|$)/.test(url) ||
-    url.includes("fxtwitter.com") ||
-    url.includes("vxtwitter.com") ||
-    url.includes("fixupx.com")
-  )
-    return "twitter";
-  if (url.includes("spotify.com")) return "spotify";
-  if (url.includes("soundcloud.com") || url.includes("on.soundcloud.com"))
-    return "soundcloud";
-  if (url.includes("pinterest.com") || url.includes("pin.it"))
-    return "pinterest";
-  if (url.includes("music.apple.com")) return "applemusic";
-  if (url.includes("facebook.com") || url.includes("fb.watch"))
-    return "facebook";
-  if (
-    url.includes("xiaohongshu.com") ||
-    url.includes("rednote.com") ||
-    url.includes("xhslink.com") ||
-    url.includes("xhslink.cn")
-  )
-    return "rednote";
-  if (url.includes("douyin.com")) return "douyin";
-  if (
-    url.includes("bilibili.com") ||
-    url.includes("b23.tv") ||
-    url.includes("bili.im") ||
-    url.includes("bilibili.tv")
-  )
-    return "bilibili";
-  if (url.includes("threads.net") || url.includes("threads.com"))
-    return "threads";
-  if (url.includes("bandcamp.com")) return "bandcamp";
-  if (url.includes("pixiv.net")) return "pixiv";
-  if (url.includes("reddit.com") || url.includes("redd.it")) return "reddit";
-  if (
-    url.includes("terabox") ||
-    url.includes("1024tera") ||
-    url.includes("nephobox") ||
-    url.includes("4funbox") ||
-    url.includes("mirrobox") ||
-    url.includes("momerybox") ||
-    url.includes("tibibox")
-  )
-    return "terabox";
-  // File hosts & Resolvers (Engine 2: Scrapr)
-  if (url.includes("mediafire.com")) return "mediafire";
-  if (url.includes("sfile.mobi") || url.includes("sfile.co")) return "sfile";
-  if (url.includes("pixeldrain.com")) return "pixeldrain";
-  if (
-    url.includes("catbox.moe") ||
-    url.includes("litterbox.catbox.moe") ||
-    url.includes("litter.catbox.moe")
-  )
-    return "catbox";
-  if (url.includes("krakenfiles.com")) return "krakenfiles";
-  if (url.includes("drive.google.com") || url.includes("docs.google.com/file"))
-    return "gdrive";
-  if (
-    /(?:doodstream\.com|ds2play\.com|doods\.pro|dood\.(?:to|so|ws|pm|wf|cx|sh|watch))/i.test(
-      url,
-    )
-  )
-    return "doodstream";
-  if (
-    url.includes("safelinku.com") ||
-    url.includes("sfl.gl") ||
-    url.includes("semawur.com") ||
-    url.includes("safelink.id") ||
-    url.includes("sfl.inc") ||
-    url.includes("khaddavi.net")
-  )
-    return "safelinku";
-  if (
-    url.includes("sub2unlock.com") ||
-    url.includes("sub2unlock.net") ||
-    url.includes("sub2unlock.io") ||
-    url.includes("sub2unlock.me") ||
-    url.includes("sub4unlock.com") ||
-    url.includes("sub4unlock.io") ||
-    url.includes("sub4unlock.net")
-  )
-    return "sub2unlock";
-  if (url.includes("rekonise.com")) return "rekonise";
-  if (
-    url.includes("bit.ly") ||
-    url.includes("tinyurl.com") ||
-    url.includes("dub.sh") ||
-    url.includes("cutt.ly") ||
-    url.includes("t.co/") ||
-    url.includes("shorturl.at") ||
-    url.includes("aka.ms")
-  )
-    return "unshorten";
-  // Comic & Manga (Engine 2: Scrapr)
-  if (url.includes("kiryuu.to") || url.includes("kiryuu.id")) return "kiryuu";
-  if (
-    url.includes("komikcast.info") ||
-    url.includes("komikcast.ch") ||
-    url.includes("komikcast.me") ||
-    url.includes("komikcast.cz")
-  )
-    return "komikcast";
-  if (url.includes("mangadex.org")) return "mangadex";
-  if (
-    url.includes("komikindo.ch") ||
-    url.includes("komikindo.org") ||
-    url.includes("komikindo.tv")
-  )
-    return "komikindo";
-  if (url.includes("komiku.org") || url.includes("komiku.id")) return "komiku";
-  if (
-    url.includes("bacakomik.my") ||
-    url.includes("bacakomik.co") ||
-    url.includes("bacakomik.one")
-  )
-    return "bacakomik";
-  if (
-    url.includes("manhwaindo.my") ||
-    url.includes("manhwaindo.id") ||
-    url.includes("manhwaindo.org")
-  )
-    return "manhwaindo";
-  if (
-    url.includes("asurascans.com") ||
-    url.includes("asuracomic.net") ||
-    url.includes("asura.gg")
-  )
-    return "asurascans";
-  if (url.includes("mangabats.com") || url.includes("mangabat.com"))
-    return "mangabats";
-
-  // Anime (Engine 2: Scrapr)
-  if (
-    url.includes("otakudesu.blog") ||
-    url.includes("otakudesu.cloud") ||
-    url.includes("otakudesu.tube") ||
-    url.includes("otakudesu.info")
-  )
-    return "otakudesu";
-  if (url.includes("nimegami.id")) return "nimegami";
-  if (
-    url.includes("gogoanime") ||
-    url.includes("gogoanimes") ||
-    url.includes("anitaku")
-  )
-    return "gogoanime";
-  if (url.includes("animetosho.org")) return "animetosho";
-  return null;
-}
-
-export const MORI_PLATFORM_SERVERS = {
-  tiktok: [
-    { id: "auto", name: "Auto (Server 1 → Server 2 fallback)" },
-    { id: "server1", name: "Server 1 (TikTokIO)" },
-    { id: "server2", name: "Server 2 (TikDownloader)" },
-  ],
-  instagram: [
-    { id: "auto", name: "Auto (Server 1 → Server 2 fallback)" },
-    { id: "server1", name: "Server 1 (InDown)" },
-    { id: "server2", name: "Server 2 (SnapSave)" },
-  ],
-  youtube: [
-    { id: "auto", name: "Auto (Server 1 → Server 2 fallback)" },
-    { id: "server1", name: "Server 1 (ytmp3.gg)" },
-    { id: "server2", name: "Server 2 (ytmp3.mobi)" },
-  ],
-  twitter: [
-    { id: "auto", name: "Auto (Server 1 → Server 2 fallback)" },
-    { id: "server1", name: "Server 1 (TwitterVideoDownloader)" },
-    { id: "server2", name: "Server 2 (SaveTWT)" },
-  ],
-  spotify: [
-    { id: "auto", name: "Auto (Server 1 → Server 2 fallback)" },
-    { id: "server1", name: "Server 1 (SpotiDown)" },
-    { id: "server2", name: "Server 2 (SoundLoaders)" },
-  ],
+/* ---------- Registri: urutan sumber = fallback otomatis ---------- */
+const SRC = {
+  youtube: [['ytmp3', youtube]],
+  tiktok: [['tikdownloader', tikdl], ['tiktokio', tiktokio], ['tikwm', tikwm]],
+  instagram: [['embed', igEmbed], ['snapsave', igSnap], ['indown', indown]],
+  twitter: [['fxtwitter', fxt], ['vxtwitter', vxt]],
+  facebook: [['snapsave', facebook]], threads: [['threadster', threads]], pinterest: [['direct', pinterest]],
+  bilibili: [['api', bilibili]], pixiv: [['ajax', pixiv]], douyin: [['iteminfo', douyin]], rednote: [['direct', rednote]],
+  shopee: [['svxtract', shopee]], soundcloud: [['forhub', soundcloud]],
+  spotify: [['spotimate', u => mate('spotify', u)]], applemusic: [['aplmate', u => mate('apple', u)]], bandcamp: [['bandcampdl', u => mate('bandcamp', u)]],
 };
-
-export const SCRAPR_PLATFORM_SERVERS = {
-  tiktok: [
-    { id: "auto", name: "Auto (Cascade all 5 servers)" },
-    { id: "tiktokio", name: "TikTokIO (Fast, HD)" },
-    { id: "tikdownloader", name: "TikDownloader (Direct HD)" },
-    { id: "snaptik", name: "SnapTik (Popular, No Watermark)" },
-    { id: "savetik", name: "SaveTik (Alternative)" },
-    { id: "ssstik", name: "SSSTik (Fallback)" },
-  ],
-  instagram: [
-    { id: "auto", name: "Auto (Cascade all 4 servers)" },
-    { id: "indown", name: "InDown (Fast, High Quality)" },
-    { id: "snapsave", name: "SnapSave (Reels/Stories/Posts)" },
-    { id: "snapinsta", name: "SnapInsta (Alternative)" },
-    { id: "direct", name: "Direct (Public Posts)" },
-  ],
-  youtube: [
-    { id: "auto", name: "Auto (ytmp3.gg → ytmp3 fallback)" },
-    { id: "ytmp3gg", name: "ytmp3.gg (Fast, 1080p/720p/MP3)" },
-    { id: "ytmp3", name: "ytmp3 (Alternative)" },
-  ],
-  twitter: [
-    { id: "auto", name: "Auto (Cascade all 4 servers)" },
-    { id: "tvd", name: "TwitterVideoDownloader (HD)" },
-    { id: "savetwt", name: "SaveTWT (Fast)" },
-    { id: "tweeload", name: "TweeLoad (Alternative)" },
-    { id: "direct", name: "Direct FXTwitter" },
-  ],
-  spotify: [
-    { id: "auto", name: "Auto (Cascade all 4 servers)" },
-    { id: "spotidown", name: "SpotiDown (Fast 320kbps)" },
-    { id: "soundloaders", name: "SoundLoaders (Reliable)" },
-    { id: "spotmate", name: "SpotMate" },
-    { id: "spotisaver", name: "SpotiSaver" },
-  ],
-  facebook: [
-    { id: "auto", name: "Auto (SnapSave → FDown fallback)" },
-    { id: "snapsave", name: "SnapSave (HD)" },
-    { id: "fdown", name: "FDown (Alternative)" },
-  ],
-  pinterest: [
-    { id: "auto", name: "Auto (PinDown → Direct fallback)" },
-    { id: "pindown", name: "PinDown" },
-    { id: "direct", name: "Direct" },
-  ],
-  bandcamp: [
-    { id: "auto", name: "Auto (Direct → BandcampDownloader fallback)" },
-    { id: "direct", name: "Direct Stream" },
-    { id: "bandcampdownloader", name: "BandcampDownloader" },
-  ],
-};
-
-export function getPlatformServers(platform, engine = "auto") {
-  if (engine === "scrapr") {
-    return SCRAPR_PLATFORM_SERVERS[platform] || null;
-  }
-  if (engine === "mori") {
-    return MORI_PLATFORM_SERVERS[platform] || null;
-  }
-  return SCRAPR_PLATFORM_SERVERS[platform] || MORI_PLATFORM_SERVERS[platform] || null;
-}
-
-export const PLATFORM_SERVERS = MORI_PLATFORM_SERVERS;
-
-// 5a. Engine 1: Mori Scraper Core
-export async function scrapeWithMori(url, platform, serverPreference = "auto") {
-  const scrapers = loadScraperEngine();
-  let srv = serverPreference;
-  if (srv === "1") srv = "server1";
-  if (srv === "2") srv = "server2";
-
-  let res = null;
-  let usedServer = "";
-
-  switch (platform) {
-    case "tiktok": {
-      if (srv === "server2") {
-        scrapers.setTikTokSource("tikdownloader");
-        res = await scrapers.scrapeTikTok(url);
-        usedServer = "TikDownloader";
-      } else if (srv === "server1") {
-        scrapers.setTikTokSource("tiktokio");
-        res = await scrapers.scrapeTikTok(url);
-        usedServer = "TikTokIO";
-      } else {
-        scrapers.setTikTokSource("tiktokio");
-        res = await scrapers.scrapeTikTok(url);
-        usedServer = "TikTokIO";
-        if (!res?.status) {
-          scrapers.setTikTokSource("tikdownloader");
-          res = await scrapers.scrapeTikTok(url);
-          usedServer = "TikDownloader";
-        }
-      }
-      break;
-    }
-    case "instagram": {
-      if (srv === "server2") {
-        scrapers.setInstagramSource("savevid");
-        res = await scrapers.scrapeInstagram(url);
-        usedServer = "SaveVid";
-      } else if (srv === "server1") {
-        scrapers.setInstagramSource("indown");
-        res = await scrapers.scrapeInstagram(url);
-        usedServer = "InDown";
-      } else {
-        scrapers.setInstagramSource("indown");
-        res = await scrapers.scrapeInstagram(url);
-        usedServer = "InDown";
-        if (!res?.status) {
-          scrapers.setInstagramSource("savevid");
-          res = await scrapers.scrapeInstagram(url);
-          usedServer = "SaveVid";
-        }
-      }
-      break;
-    }
-    case "youtube": {
-      const videoMatch = url.match(
-        /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|shorts|live)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i,
-      );
-      const isPlaylist =
-        url.includes("list=") && (!videoMatch?.[1] || url.includes("/playlist"));
-      const targetUrl =
-        !isPlaylist && videoMatch?.[1]
-          ? `https://www.youtube.com/watch?v=${videoMatch[1]}`
-          : url;
-      if (srv === "server2") {
-        scrapers.setYouTubeSource("mobi");
-        res = await scrapers.scrapeYouTube(targetUrl);
-        usedServer = "ytmp3.mobi";
-      } else if (srv === "server1") {
-        scrapers.setYouTubeSource("gg");
-        res = await scrapers.scrapeYouTube(targetUrl);
-        usedServer = "ytmp3.gg";
-      } else {
-        scrapers.setYouTubeSource("gg");
-        res = await scrapers.scrapeYouTube(targetUrl);
-        usedServer = "ytmp3.gg";
-        if (!res?.status) {
-          scrapers.setYouTubeSource("mobi");
-          res = await scrapers.scrapeYouTube(targetUrl);
-          usedServer = "ytmp3.mobi";
-        }
-      }
-      break;
-    }
-    case "twitter": {
-      if (srv === "server2") {
-        scrapers.setTwitterSource("savetwt");
-        res = await scrapers.scrapeTwitter(url);
-        usedServer = "SaveTWT";
-      } else if (srv === "server1") {
-        scrapers.setTwitterSource("tvd");
-        res = await scrapers.scrapeTwitter(url);
-        usedServer = "TwitterVideoDownloader";
-      } else {
-        scrapers.setTwitterSource("tvd");
-        res = await scrapers.scrapeTwitter(url);
-        usedServer = "TwitterVideoDownloader";
-        if (!res?.status) {
-          scrapers.setTwitterSource("savetwt");
-          res = await scrapers.scrapeTwitter(url);
-          usedServer = "SaveTWT";
-        }
-      }
-      break;
-    }
-    case "spotify": {
-      if (srv === "server2") {
-        scrapers.setSpotifySource("soundloaders");
-        res = await scrapers.scrapeSpotify(url);
-        usedServer = "SoundLoaders";
-      } else if (srv === "server1") {
-        scrapers.setSpotifySource("spotidown");
-        res = await scrapers.scrapeSpotify(url);
-        usedServer = "SpotiDown";
-      } else {
-        scrapers.setSpotifySource("spotidown");
-        res = await scrapers.scrapeSpotify(url);
-        usedServer = "SpotiDown";
-        if (!res?.status) {
-          scrapers.setSpotifySource("soundloaders");
-          res = await scrapers.scrapeSpotify(url);
-          usedServer = "SoundLoaders";
-        }
-      }
-      break;
-    }
-    case "pinterest":
-      res = await scrapers.scrapePinterest(url);
-      usedServer = "Pinterest";
-      break;
-    case "applemusic":
-      res = await scrapers.scrapeAppleMusic(url);
-      usedServer = "Aplmate";
-      break;
-    case "facebook":
-      res = await scrapers.scrapeFacebook(url);
-      usedServer = "SnapSave";
-      break;
-    case "rednote":
-      res = await scrapers.scrapeRedNote(url);
-      usedServer = "RedNote";
-      break;
-    case "douyin":
-      res = await scrapers.scrapeDouyin(url);
-      usedServer = "Douyin";
-      break;
-    case "bilibili":
-      res = await scrapers.scrapeBilibili(url);
-      usedServer = "Bilibili";
-      break;
-    case "threads":
-      res = await scrapers.scrapeThreads(url);
-      usedServer = "Threads";
-      break;
-    case "bandcamp":
-      res = await scrapers.scrapeBandcamp(url);
-      usedServer = "Bandcamp";
-      break;
-    case "pixiv":
-      res = await scrapers.scrapePixiv(url);
-      usedServer = "Pixiv";
-      break;
-    case "reddit":
-      res = await scrapers.scrapeReddit(url);
-      usedServer = "RapidSave";
-      break;
-    case "terabox":
-      res = await scrapers.scrapeTeraBox(url);
-      usedServer = "TeraBox";
-      break;
-    default:
-      throw new Error(`Platform handler missing for ${platform}`);
-  }
-
-  if (!res || !res.status) {
-    throw new Error(res?.message || `Failed to scrape media from ${platform}.`);
-  }
-
-  const result = res.result || {};
-  if (result.title) {
-    result.title = decodeHtmlEntities(result.title);
-  }
-
-  return {
-    platform,
-    engine: "mori",
-    server: usedServer,
-    ...result,
-  };
-}
-
-// 5b. Engine 2: Scrapr Stand-alone Scraper & Resolver
-export async function scrapeWithScrapr(
-  url,
-  platform,
-  serverPreference = "auto",
-) {
-  const scrapr = loadScraprEngine();
-  let srv = serverPreference;
-  if (srv === "1") srv = "server1";
-  if (srv === "2") srv = "server2";
-
-  let res = null;
-  let usedServer = "";
-
-  switch (platform) {
-    case "tiktok": {
-      if (srv === "tiktokio" || srv === "server1") {
-        res = await scrapr.tiktok.tiktokio(url);
-        usedServer = "TikTokIO";
-      } else if (srv === "tikdownloader" || srv === "server2") {
-        res = await scrapr.tiktok.tikdownloader(url);
-        usedServer = "TikDownloader";
-      } else if (srv === "snaptik") {
-        res = await scrapr.tiktok.snaptik(url);
-        usedServer = "SnapTik";
-      } else if (srv === "savetik") {
-        res = await scrapr.tiktok.savetik(url);
-        usedServer = "SaveTik";
-      } else if (srv === "ssstik") {
-        res = await scrapr.tiktok.ssstik(url);
-        usedServer = "SSSTik";
-      } else {
-        res = await scrapr.tiktok.tiktokio(url);
-        usedServer = "TikTokIO";
-        if (!res?.status) {
-          res = await scrapr.tiktok.tikdownloader(url);
-          usedServer = "TikDownloader";
-        }
-        if (!res?.status) {
-          res = await scrapr.tiktok.snaptik(url);
-          usedServer = "SnapTik";
-        }
-        if (!res?.status) {
-          res = await scrapr.tiktok.savetik(url);
-          usedServer = "SaveTik";
-        }
-        if (!res?.status) {
-          res = await scrapr.tiktok.ssstik(url);
-          usedServer = "SSSTik";
-        }
-      }
-      break;
-    }
-    case "instagram": {
-      if (srv === "indown" || srv === "server1") {
-        res = await scrapr.instagram.indown(url);
-        usedServer = "InDown";
-      } else if (srv === "snapsave" || srv === "server2") {
-        res = await scrapr.instagram.snapsave(url);
-        usedServer = "SnapSave";
-      } else if (srv === "snapinsta") {
-        res = await scrapr.instagram.snapinsta(url);
-        usedServer = "SnapInsta";
-      } else if (srv === "direct") {
-        res = await scrapr.instagram.direct(url);
-        usedServer = "Direct";
-      } else {
-        res = await scrapr.instagram.indown(url);
-        usedServer = "InDown";
-        if (!res?.status) {
-          res = await scrapr.instagram.snapsave(url);
-          usedServer = "SnapSave";
-        }
-        if (!res?.status) {
-          res = await scrapr.instagram.snapinsta(url);
-          usedServer = "SnapInsta";
-        }
-        if (!res?.status) {
-          res = await scrapr.instagram.direct(url);
-          usedServer = "Direct";
-        }
-      }
-      break;
-    }
-    case "youtube": {
-      const videoMatch = url.match(
-        /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|shorts|live)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i,
-      );
-      const isPlaylist =
-        url.includes("list=") && (!videoMatch?.[1] || url.includes("/playlist"));
-      const targetUrl =
-        !isPlaylist && videoMatch?.[1]
-          ? `https://www.youtube.com/watch?v=${videoMatch[1]}`
-          : url;
-      if (srv === "ytmp3gg" || srv === "server1") {
-        res = await scrapr.youtube.ytmp3gg(targetUrl);
-        usedServer = "ytmp3.gg";
-      } else if (srv === "ytmp3" || srv === "server2") {
-        res = await scrapr.youtube.ytmp3(targetUrl);
-        usedServer = "ytmp3";
-      } else {
-        res = await scrapr.youtube.ytmp3gg(targetUrl);
-        usedServer = "ytmp3.gg";
-        if (!res?.status) {
-          res = await scrapr.youtube.ytmp3(targetUrl);
-          usedServer = "ytmp3";
-        }
-      }
-      break;
-    }
-    case "twitter": {
-      if (srv === "tvd" || srv === "server1") {
-        res = await scrapr.twitter.tvd(url);
-        usedServer = "TwitterVideoDownloader";
-      } else if (srv === "savetwt" || srv === "server2") {
-        res = await scrapr.twitter.savetwt(url);
-        usedServer = "SaveTWT";
-      } else if (srv === "tweeload") {
-        res = await scrapr.twitter.tweeload(url);
-        usedServer = "TweeLoad";
-      } else if (srv === "direct") {
-        res = await scrapr.twitter.direct(url);
-        usedServer = "Direct FXTwitter";
-      } else {
-        res = await scrapr.twitter.tvd(url);
-        usedServer = "TwitterVideoDownloader";
-        if (!res?.status) {
-          res = await scrapr.twitter.savetwt(url);
-          usedServer = "SaveTWT";
-        }
-        if (!res?.status) {
-          res = await scrapr.twitter.tweeload(url);
-          usedServer = "TweeLoad";
-        }
-        if (!res?.status) {
-          res = await scrapr.twitter.direct(url);
-          usedServer = "Direct FXTwitter";
-        }
-      }
-      break;
-    }
-    case "spotify": {
-      if (srv === "spotidown" || srv === "server1") {
-        res = await scrapr.spotify.spotidown(url);
-        usedServer = "SpotiDown";
-      } else if (srv === "soundloaders" || srv === "server2") {
-        res = await scrapr.spotify.soundloaders(url);
-        usedServer = "SoundLoaders";
-      } else if (srv === "spotmate") {
-        res = await scrapr.spotify.spotmate(url);
-        usedServer = "SpotMate";
-      } else if (srv === "spotisaver") {
-        res = await scrapr.spotify.spotisaver(url);
-        usedServer = "SpotiSaver";
-      } else {
-        res = await scrapr.spotify.spotidown(url);
-        usedServer = "SpotiDown";
-        if (!res?.status) {
-          res = await scrapr.spotify.soundloaders(url);
-          usedServer = "SoundLoaders";
-        }
-        if (!res?.status) {
-          res = await scrapr.spotify.spotmate(url);
-          usedServer = "SpotMate";
-        }
-        if (!res?.status) {
-          res = await scrapr.spotify.spotisaver(url);
-          usedServer = "SpotiSaver";
-        }
-      }
-      break;
-    }
-    case "soundcloud":
-      res = await scrapr.soundcloud.klickaud(url);
-      usedServer = "KlickAud";
-      break;
-    case "pinterest": {
-      if (srv === "pindown" || srv === "server1") {
-        res = await scrapr.pinterest.pindown(url);
-        usedServer = "PinDown";
-      } else if (srv === "direct" || srv === "server2") {
-        res = await scrapr.pinterest.direct(url);
-        usedServer = "Direct";
-      } else {
-        res = await scrapr.pinterest.pindown(url);
-        usedServer = "PinDown";
-        if (!res?.status) {
-          res = await scrapr.pinterest.direct(url);
-          usedServer = "Direct";
-        }
-      }
-      break;
-    }
-    case "facebook": {
-      if (srv === "snapsave" || srv === "server1") {
-        res = await scrapr.facebook.snapsave(url);
-        usedServer = "SnapSave";
-      } else if (srv === "fdown" || srv === "server2") {
-        res = await scrapr.facebook.fdown(url);
-        usedServer = "FDown";
-      } else {
-        res = await scrapr.facebook.snapsave(url);
-        usedServer = "SnapSave";
-        if (!res?.status) {
-          res = await scrapr.facebook.fdown(url);
-          usedServer = "FDown";
-        }
-      }
-      break;
-    }
-    case "threads":
-      res = await scrapr.threads.threadster(url);
-      usedServer = "Threadster";
-      break;
-    case "pixiv":
-      res = await scrapr.pixiv.ajax(url);
-      usedServer = "Pixiv";
-      break;
-    case "rednote":
-      res = await scrapr.rednote.direct(url);
-      usedServer = "RedNote";
-      break;
-    case "douyin":
-      res = await scrapr.douyin.direct(url);
-      usedServer = "Douyin";
-      break;
-    case "bilibili":
-      res = await scrapr.bilibili.direct(url);
-      usedServer = "Bilibili";
-      break;
-    case "reddit":
-      res = await scrapr.reddit.rapidsave(url);
-      usedServer = "RapidSave";
-      break;
-    case "terabox":
-      res = await scrapr.terabox.sechno(url);
-      usedServer = "Sechno";
-      break;
-    case "bandcamp": {
-      res = await scrapr.bandcamp.direct(url);
-      usedServer = "Direct";
-      if (!res?.status) {
-        res = await scrapr.bandcamp.bandcampdownloader(url);
-        usedServer = "BandcampDownloader";
-      }
-      break;
-    }
-    case "applemusic":
-      res = await scrapr.applemusic.aplmate(url);
-      break;
-    case "mediafire":
-      res = await scrapr.resolver.mediafire(url);
-      break;
-    case "sfile":
-      res = await scrapr.resolver.sfile(url);
-      break;
-    case "pixeldrain":
-      res = await scrapr.resolver.pixeldrain(url);
-      break;
-    case "catbox":
-      res = await scrapr.resolver.catbox(url);
-      break;
-    case "krakenfiles":
-      res = await scrapr.resolver.krakenfiles(url);
-      break;
-    case "gdrive":
-      res = await scrapr.resolver.gdrive(url);
-      break;
-    case "doodstream":
-      res = await scrapr.resolver.doodstream(url);
-      break;
-    case "safelinku":
-      res = await scrapr.resolver.safelinku(url);
-      break;
-    case "sub2unlock":
-      res = await scrapr.resolver.sub2unlock(url);
-      break;
-    case "rekonise":
-      res = await scrapr.resolver.rekonise(url);
-      break;
-    case "unshorten":
-      res = await scrapr.resolver.unshorten(url);
-      break;
-    // Comic & Manga
-    case "kiryuu":
-      res = await scrapr.comic.kiryuu(url);
-      usedServer = "Kiryuu";
-      break;
-    case "komikcast":
-      res = await scrapr.comic.komikcast(url);
-      usedServer = "Komikcast";
-      break;
-    case "mangadex":
-      res = await scrapr.comic.mangadex(url);
-      usedServer = "MangaDex";
-      break;
-    case "komikindo":
-      res = await scrapr.comic.komikindo(url);
-      usedServer = "Komikindo";
-      break;
-    case "komiku":
-      res = await scrapr.comic.komiku(url);
-      usedServer = "Komiku";
-      break;
-    case "bacakomik":
-      res = await scrapr.comic.bacakomik(url);
-      usedServer = "Bacakomik";
-      break;
-    case "manhwaindo":
-      res = await scrapr.comic.manhwaindo(url);
-      usedServer = "ManhwaIndo";
-      break;
-    case "asurascans":
-      res = await scrapr.comic.asurascans(url);
-      usedServer = "AsuraScans";
-      break;
-    case "mangabats":
-      res = await scrapr.comic.mangabats(url);
-      usedServer = "MangaBats";
-      break;
-    // Anime
-    case "otakudesu":
-      res = await scrapr.anime.otakudesu(url);
-      usedServer = "Otakudesu";
-      break;
-    case "nimegami":
-      res = await scrapr.anime.nimegami(url);
-      usedServer = "Nimegami";
-      break;
-    case "gogoanime":
-      res = await scrapr.anime.gogoanime(url);
-      usedServer = "Gogoanime";
-      break;
-    case "animetosho":
-      res = await scrapr.anime.animetosho(url);
-      usedServer = "AnimeTosho";
-      break;
-    default:
-      throw new Error(`Scrapr does not support platform: ${platform}`);
-  }
-
-  if (!res || !res.status) {
-    throw new Error(
-      res?.message || `Failed to scrape media with Scrapr from ${platform}.`,
-    );
-  }
-
-  const result = res.result || {};
-  if (result.title) {
-    result.title = decodeHtmlEntities(result.title);
-  }
-  if (result.author && typeof result.author === "object") {
-    result.author =
-      result.author.name ||
-      result.author.username ||
-      result.author.nickname ||
-      "Creator";
-  }
-
-  let downloads = result.downloads || [];
-  const primaryUrl = result.destinationUrl || result.url;
-  if (!downloads.length && primaryUrl) {
-    downloads = [
-      {
-        type: SHORTLINK_PLATFORMS.has(platform) ? "link" : (result.type || "file"),
-        quality: SHORTLINK_PLATFORMS.has(platform) ? "Resolved Link" : "Direct Download",
-        url: primaryUrl,
-      },
-    ];
-  }
-
-  return {
-    platform,
-    engine: "scrapr",
-    server: usedServer,
-    ...result,
-    downloads,
-  };
-}
-
-// 5c. Unified Scraper with Engine Routing & Automatic Fallback
-export async function scrapeUrl(
-  url,
-  serverPreference = "auto",
-  enginePreference = "auto",
-) {
-  const platform = detectPlatform(url);
-  if (!platform) {
-    throw new Error("URL is not supported by Mori.");
-  }
-
-  const engine = (enginePreference || "auto").toLowerCase();
-  const moriInstalled = isMoriInstalled();
-  const scraprInstalled = isScraprInstalled();
-
-  if (!moriInstalled && !scraprInstalled) {
-    throw new Error(
-      "No scraper engine installed. Run 'mori' or use /engine to install.",
-    );
-  }
-
-  // If platform is exclusive to Scrapr
-  if (SCRAPR_ONLY_PLATFORMS.has(platform)) {
-    if (!scraprInstalled) {
-      throw new Error(
-        `Platform '${platform}' requires Scrapr engine. Install with /engine.`,
-      );
-    }
-    return scrapeWithScrapr(url, platform, serverPreference);
-  }
-
-  // Engine 2 explicit
-  if (engine === "scrapr") {
-    if (!scraprInstalled) {
-      throw new Error("Scrapr engine is not installed. Install with /engine.");
-    }
-    return scrapeWithScrapr(url, platform, serverPreference);
-  }
-
-  // Engine 1 explicit
-  if (engine === "mori") {
-    if (!moriInstalled) {
-      throw new Error("Mori engine is not installed. Install with /engine.");
-    }
-    return scrapeWithMori(url, platform, serverPreference);
-  }
-
-  // Auto mode: single engine fallback
-  if (!moriInstalled && scraprInstalled) {
-    return scrapeWithScrapr(url, platform, serverPreference);
-  }
-  if (moriInstalled && !scraprInstalled) {
-    return scrapeWithMori(url, platform, serverPreference);
-  }
-
-  // Both installed: Engine 1 (Mori) first -> fallback to Engine 2 (Scrapr)
-  try {
-    return await scrapeWithMori(url, platform, serverPreference);
-  } catch (moriErr) {
+async function run(input, status) {
+  const url = clean(input); if (!url) throw new Error('Tempel link terlebih dulu');
+  const p = detect(url); if (!p) throw new Error('Platform belum didukung');
+  const name = PL.find(x => x[0] === p)[1];
+  let err = null;
+  for (const [sn, fn] of SRC[p]) {
+    status && status(name + ' · ' + sn + '…');
     try {
-      const scraprRes = await scrapeWithScrapr(url, platform, serverPreference);
-      scraprRes.fallbackFromMori = true;
-      return scraprRes;
-    } catch (_) {
-      throw moriErr;
-    }
+      const r = await fn(url);
+      if (r && r.items && r.items.length) return Object.assign({ platform: p, pname: name, src: sn, url, author: '' }, r);
+    } catch (e) { err = e; }
   }
+  throw err || new Error('Gagal mengambil media');
 }
-
-// 6. Asynchronous Direct URL Resolvers
-export async function resolveUrl(url, onStatus) {
-  const scraperFetch = getScraperFetch();
-
-  if (url.startsWith("applemusic_resolve:")) {
-    if (onStatus) onStatus("Resolving Apple Music direct stream...");
-    const payloadStr = url.replace("applemusic_resolve:", "");
-    const res = await scraperFetch({
-      method: "POST",
-      url: "https://aplmate.com/action/track",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": CHROME_UA,
-        "X-Requested-With": "XMLHttpRequest",
-        Referer: "https://aplmate.com/",
-        Origin: "https://aplmate.com",
-      },
-      data: payloadStr,
-    });
-    let dd = typeof res === "string" ? JSON.parse(res) : res;
-    let dlHtml = (typeof dd === "object" ? dd?.data : dd) || "";
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(dlHtml, "text/html");
-    let foundLink = "";
-    doc.querySelectorAll("a").forEach((a) => {
-      const href = a.getAttribute("href");
-      const text = a.textContent.trim();
-      if (
-        href &&
-        (href.includes("/dl?token=") || a.classList?.contains("abutton"))
-      ) {
-        if (
-          !href.includes("ko-fi.com") &&
-          !href.includes("premium.html") &&
-          !text.toLowerCase().includes("another song")
-        ) {
-          if (!foundLink)
-            foundLink = href.startsWith("http")
-              ? href
-              : "https://aplmate.com" + href;
-        }
-      }
-    });
-    if (!foundLink)
-      throw new Error("Could not resolve Apple Music download link.");
-    return foundLink;
-  }
-
-  if (
-    url.startsWith("spotidown_resolve:") ||
-    url.startsWith("soundloaders_resolve:")
-  ) {
-    if (onStatus) onStatus("Resolving Spotify direct track...");
-    function createMultipartBody(fields) {
-      const boundary =
-        "----WebKitFormBoundary" + Math.random().toString(36).substring(2);
-      let body = "";
-      for (const [k, v] of Object.entries(fields)) {
-        if (v !== undefined && v !== null) {
-          body += `--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`;
-        }
-      }
-      body += `--${boundary}--\r\n`;
-      return {
-        body,
-        contentType: `multipart/form-data; boundary=${boundary}`,
-      };
-    }
-
-    const isSoundloaders = url.startsWith("soundloaders_resolve:");
-    const parts = url
-      .replace("spotidown_resolve:", "")
-      .replace("soundloaders_resolve:", "")
-      .split("|||");
-    let dataVal = parts[0] || "";
-    let tokenVal = parts[1] || "";
-    let baseVal = parts[2] ? decodeURIComponent(parts[2]) : "";
-    let cookiesStr = parts[3] ? decodeURIComponent(parts[3]) : "";
-
-    if (dataVal.includes("=") && (!tokenVal || !tokenVal.startsWith("http"))) {
-      try {
-        const sp = new URLSearchParams(dataVal);
-        if (sp.has("data")) dataVal = sp.get("data") || "";
-        if (sp.has("token")) tokenVal = sp.get("token") || "";
-        if (sp.has("base")) baseVal = sp.get("base") || "";
-        if (parts[1]) cookiesStr = decodeURIComponent(parts[1]);
-      } catch (_) {}
-    }
-
-    let foundLink = "";
-
-    // 1. If Soundloaders, try Spotimate first (if it doesn't fail with turnstile token)
-    if (isSoundloaders && !tokenVal.startsWith("bccpF:")) {
-      try {
-        if (!cookiesStr) {
-          try {
-            const rHome = await scraperFetch({
-              url: "https://spotimate.app/en1",
-              headers: { "User-Agent": CHROME_UA },
-              rawResponse: true,
-            });
-            let freshCookies = getCookiesFromHeaders(rHome.headers) || "";
-            const rVerify = await scraperFetch({
-              url: "https://spotimate.app/api/userverify",
-              method: "POST",
-              data: "url=" + encodeURIComponent(baseVal || "https://open.spotify.com"),
-              headers: {
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "User-Agent": CHROME_UA,
-                Referer: "https://spotimate.app/en1",
-                Origin: "https://spotimate.app",
-                ...(freshCookies ? { Cookie: freshCookies } : {}),
-              },
-              rawResponse: true,
-            });
-            const vCookies = getCookiesFromHeaders(rVerify.headers);
-            if (vCookies) freshCookies = freshCookies ? `${freshCookies}; ${vCookies}` : vCookies;
-            if (freshCookies) cookiesStr = freshCookies;
-          } catch (_) {}
-        }
-
-        const mp = createMultipartBody({
-          data: dataVal,
-          token: tokenVal,
-          track_token: tokenVal,
-          ...(baseVal ? { base: baseVal } : {}),
-        });
-        const slHeaders = {
-          "Content-Type": mp.contentType,
-          "User-Agent": CHROME_UA,
-          Referer: "https://spotimate.app/en1",
-          Origin: "https://spotimate.app",
-        };
-        if (cookiesStr) slHeaders["Cookie"] = cookiesStr;
-
-        const res = await scraperFetch({
-          url: "https://spotimate.app/action/track",
-          method: "POST",
-          headers: slHeaders,
-          data: mp.body,
-          rawResponse: true,
-        });
-        let dd = res?.data ?? res;
-        if (typeof dd === "string") {
-          try {
-            dd = JSON.parse(dd);
-          } catch (_) {}
-        }
-        let dlHtml = (typeof dd === "object" ? dd?.html || dd?.data : dd) || "";
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(dlHtml, "text/html");
-        doc.querySelectorAll("a").forEach((a) => {
-          const href = a.getAttribute("href")?.trim();
-          const text = a.textContent.trim();
-          if (
-            href &&
-            href.startsWith("http") &&
-            !href.includes("tunecable.com") &&
-            !href.includes("premium") &&
-            !text.toLowerCase().includes("cover") &&
-            !href.includes("scdn.co") &&
-            text !== "Download Another Song"
-          ) {
-            if (!foundLink) foundLink = href;
-          }
-        });
-        if (!foundLink) {
-          const match =
-            dlHtml.match(
-              /href=["'](https:\/\/(?:dl\.spotimate\.app|dl\.soundloaders\.app)[^"']+)["']/,
-            ) ||
-            dlHtml.match(
-              /href=["'](https:\/\/[^"']*(?:cdnv1|\/v1\?token=)[^"']+)["']/,
-            );
-          if (match && match[1]) {
-            foundLink = match[1];
-          }
-        }
-      } catch (_) {}
-    }
-
-    // 2. If SpotiDown or Spotimate fallback needed:
-    if (!foundLink && baseVal) {
-      let spData = dataVal;
-      let spToken = tokenVal;
-      let spBase = baseVal;
-      let spCookies = cookiesStr;
-
-      // If came from Soundloaders, we need genuine SpotiDown tokens
-      if (isSoundloaders || !spData || !spToken || spToken.startsWith("bccpF:")) {
-        try {
-          const rSession = await scraperFetch({
-            url: "https://spotidown.app/action",
-            method: "POST",
-            data: `url=${encodeURIComponent(baseVal)}&g-recaptcha-response=dummy_token`,
-            headers: {
-              "Content-Type":
-                "application/x-www-form-urlencoded; charset=UTF-8",
-              "User-Agent": CHROME_UA,
-              "X-Requested-With": "XMLHttpRequest",
-              Origin: "https://spotidown.app",
-              Referer: "https://spotidown.app/",
-            },
-            rawResponse: true,
-          });
-          const freshCookies = getCookiesFromHeaders(rSession.headers) || "";
-          if (freshCookies) spCookies = freshCookies;
-          let rData = rSession?.data;
-          if (typeof rData === "string") {
-            try {
-              rData = JSON.parse(rData);
-            } catch (_) {}
-          }
-          const html = rData?.data || rData?.html || "";
-          const parser = new DOMParser();
-          const doc = parser.parseFromString(html, "text/html");
-          const form = doc.querySelector('form[name="submitspurl"]');
-          if (form) {
-            spData = form.querySelector('input[name="data"]')?.value || "";
-            spToken = form.querySelector('input[name="token"]')?.value || "";
-            spBase = form.querySelector('input[name="base"]')?.value || baseVal;
-          }
-        } catch (_) {}
-      }
-
-      if (spData && spToken) {
-        const mp = createMultipartBody({
-          data: spData,
-          base: spBase,
-          token: spToken,
-        });
-
-        const reqHeaders = {
-          "Content-Type": mp.contentType,
-          "User-Agent": CHROME_UA,
-          "X-Requested-With": "XMLHttpRequest",
-          Referer: "https://spotidown.app/",
-          Origin: "https://spotidown.app",
-        };
-        if (spCookies) reqHeaders["Cookie"] = spCookies;
-
-        const res = await scraperFetch({
-          url: "https://spotidown.app/action/track",
-          method: "POST",
-          headers: reqHeaders,
-          data: mp.body,
-          rawResponse: true,
-        });
-        let dd = res?.data ?? res;
-        if (typeof dd === "string") {
-          try {
-            dd = JSON.parse(dd);
-          } catch (_) {}
-        }
-        let dlHtml = (typeof dd === "object" ? dd?.data || dd?.html : dd) || "";
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(dlHtml, "text/html");
-        doc.querySelectorAll("a").forEach((a) => {
-          const href = a.getAttribute("href");
-          const text = a.textContent.trim();
-          if (
-            href &&
-            href.startsWith("http") &&
-            !href.includes("premium.html") &&
-            !href.includes("ko-fi.com") &&
-            text !== "Download Another Song"
-          ) {
-            if (!foundLink) foundLink = href;
-          }
-        });
-      }
-    }
-
-    if (!foundLink) throw new Error("Could not resolve Spotify download link.");
-    return foundLink;
-  }
-
-  if (
-    url.startsWith("youtube_resolve:") ||
-    url.startsWith("ytmp3gg_resolve:")
-  ) {
-    if (onStatus) onStatus("Resolving YouTube audio via converter...");
-    const raw = url.startsWith("youtube_resolve:")
-      ? url.replace("youtube_resolve:", "")
-      : url.replace("ytmp3gg_resolve:", "");
-    const [ytId, format = "mp3"] = raw.split("|||");
-
-    const mobiHeaders = {
-      Origin: "https://ytmp3.mobi",
-      Referer: "https://ytmp3.mobi/en8/",
-      "User-Agent": CHROME_UA,
-      "Sec-Fetch-Dest": "empty",
-      "Sec-Fetch-Mode": "cors",
-      "Sec-Fetch-Site": "cross-site",
-      Accept: "*/*",
-    };
-
-    const initData = await scraperFetch({
-      url: `https://a.ymcdn.org/api/v1/init?p=y&23=1llum1n471&_=${Math.random()}`,
-      headers: mobiHeaders,
-    });
-
-    if (initData && !initData.error && initData.convertURL) {
-      let convData = await scraperFetch({
-        url: `${initData.convertURL}&v=${ytId}&f=${format}&_=${Math.random()}`,
-        headers: mobiHeaders,
-      });
-
-      while (convData && convData.redirect > 0 && convData.redirectURL) {
-        convData = await scraperFetch({
-          url: `${convData.redirectURL}&v=${ytId}&f=${format}&_=${Math.random()}`,
-          headers: mobiHeaders,
-        });
-      }
-
-      if (convData && !convData.error) {
-        let dlUrl = convData.downloadURL;
-        let progUrl = convData.progressURL;
-        let progress = 0;
-        let attempts = 0;
-
-        while (progress < 3 && attempts < 25) {
-          await new Promise((r) => setTimeout(r, 1200));
-          const pData = await scraperFetch({
-            url: `${progUrl}&_=${Math.random()}`,
-            headers: mobiHeaders,
-          });
-          if (pData && !pData.error) {
-            progress = pData.progress;
-            if (pData.downloadURL) dlUrl = pData.downloadURL;
-            if (progress >= 3) break;
-          }
-          attempts++;
-        }
-
-        if (dlUrl && progress >= 3) {
-          if (dlUrl.startsWith("//")) dlUrl = "https:" + dlUrl;
-          if (dlUrl.startsWith("/")) dlUrl = "https://ytmp3.mobi" + dlUrl;
-          return dlUrl;
-        }
-      }
-    }
-    throw new Error("YouTube direct conversion timed out or failed.");
-  }
-
-  return url;
+async function resolve(item) {
+  if (!item.lazy) return item;
+  const l = item.lazy;
+  if (l.k === 'yt') { const r = await ytGet(l.id, l.f); if (!r) throw new Error('Konversi gagal'); return Object.assign({}, item, { url: r.url }); }
+  if (l.k === 'mate') { const L = (await mateTrack(l.m, l.ck, l.f)).filter(x => !x.cover); if (!L[0]) throw new Error('Tautan tidak ditemukan'); return Object.assign({}, item, { url: L[0].url }); }
+  return item;
 }
-
-// 7. Filename Sanitizer
-export function sanitizeFilename(title, ext = "mp4") {
-  const decoded = decodeHtmlEntities(title || "Mori_Download");
-  const safe = decoded
-    .replace(/[\\/:*?"<>|#%&{}\[\]@$^+=~`';,]/g, "")
-    .replace(/\s+/g, "_")
-    .replace(/_+/g, "_")
-    .trim()
-    .substring(0, 75);
-  const cleanExt = ext.replace(/^\./, "");
-  return `${safe || "Media"}.${cleanExt}`;
-}
-
-// 8. Stream Downloader with Progress Reporting
-export async function downloadMediaFile(
-  downloadUrl,
-  outputPath,
-  onProgress,
-  extraHeaders = {},
-) {
-  const res = await fetch(downloadUrl, {
-    headers: {
-      "User-Agent": CHROME_UA,
-      Accept: "*/*",
-      ...extraHeaders,
-    },
-  });
-
-  if (!res.ok) {
-    throw new Error(`Download HTTP error: ${res.status} ${res.statusText}`);
-  }
-
-  const contentType = (res.headers.get("content-type") || "").toLowerCase();
-  if (
-    contentType.includes("text/html") &&
-    !outputPath.endsWith(".html") &&
-    !outputPath.endsWith(".txt")
-  ) {
-    throw new Error(
-      "Received HTML webpage instead of a direct media stream. Please select a Direct MP4 stream.",
-    );
-  }
-
-  const totalBytes = parseInt(res.headers.get("content-length") || "0", 10);
-  const fileStream = fs.createWriteStream(outputPath);
-
-  let downloadedBytes = 0;
-  let startTime = Date.now();
-  let lastReport = 0;
-
-  if (res.body?.getReader) {
-    const reader = res.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      downloadedBytes += value.length;
-      fileStream.write(Buffer.from(value));
-
-      const now = Date.now();
-      if (now - lastReport > 150 || downloadedBytes === totalBytes) {
-        lastReport = now;
-        const elapsedSec = (now - startTime) / 1000 || 0.001;
-        const speedBps = downloadedBytes / elapsedSec;
-        if (onProgress) {
-          onProgress({
-            downloadedBytes,
-            totalBytes,
-            percent: totalBytes > 0 ? (downloadedBytes / totalBytes) * 100 : 0,
-            speedBps,
-          });
-        }
-      }
-    }
-    fileStream.end();
-  } else {
-    const buffer = Buffer.from(await res.arrayBuffer());
-    fs.writeFileSync(outputPath, buffer);
-    if (onProgress) {
-      onProgress({
-        downloadedBytes: buffer.length,
-        totalBytes: buffer.length,
-        percent: 100,
-        speedBps: buffer.length,
-      });
-    }
-  }
-
-  return outputPath;
-}
-
-// 9. Media & Network Utilities
-
-export function openFile(filePath) {
-  const plat = process.platform;
-  const cmd =
-    plat === "darwin"
-      ? `open "${filePath}"`
-      : plat === "win32"
-        ? `start "" "${filePath}"`
-        : `xdg-open "${filePath}"`;
-  return new Promise((resolve, reject) => {
-    exec(cmd, (err) => (err ? reject(err) : resolve()));
-  });
-}
-
-export async function pingNetwork(host = "1.1.1.1") {
-  const cleanHost = (host || "1.1.1.1")
-    .trim()
-    .replace(/^https?:\/\//i, "")
-    .split("/")[0];
-  const isWin = process.platform === "win32";
-  const cmd = isWin
-    ? `ping -n 3 -w 2000 ${cleanHost}`
-    : `ping -c 3 -W 2 ${cleanHost}`;
-
-  return new Promise((resolve) => {
-    exec(cmd, { encoding: "utf8", timeout: 8000 }, (err, stdout) => {
-      if (!err && stdout) {
-        const unixMatch = stdout.match(
-          /(?:round-trip|rtt)[^=]*=\s*([0-9.]+)\/([0-9.]+)\/([0-9.]+)/i,
-        );
-        const winMatch = stdout.match(
-          /Minimum\s*=\s*([0-9]+)ms.*Maximum\s*=\s*([0-9]+)ms.*Average\s*=\s*([0-9]+)ms/i,
-        );
-        const lossMatch =
-          stdout.match(/([0-9.]+)%\s*packet loss/i) ||
-          stdout.match(/loss\s*\(([0-9.]+)%/i);
-        const loss = lossMatch ? `${lossMatch[1]}%` : "0%";
-
-        if (unixMatch) {
-          return resolve({
-            host: cleanHost,
-            avg: Math.round(parseFloat(unixMatch[2])),
-            min: Math.round(parseFloat(unixMatch[1])),
-            max: Math.round(parseFloat(unixMatch[3])),
-            loss,
-            ok: true,
-          });
-        }
-        if (winMatch) {
-          return resolve({
-            host: cleanHost,
-            avg: parseInt(winMatch[3], 10),
-            min: parseInt(winMatch[1], 10),
-            max: parseInt(winMatch[2], 10),
-            loss,
-            ok: true,
-          });
-        }
-      }
-
-      // Fallback: fast HTTP latency check if ICMP blocked
-      const start = Date.now();
-      fetch(`https://${cleanHost}`, {
-        method: "HEAD",
-        signal: AbortSignal.timeout(3000),
-      })
-        .then(() => {
-          const ms = Date.now() - start;
-          resolve({
-            host: cleanHost,
-            avg: ms,
-            min: ms,
-            max: ms,
-            loss: "0%",
-            ok: true,
-          });
-        })
-        .catch(() => {
-          resolve({
-            host: cleanHost,
-            avg: -1,
-            min: -1,
-            max: -1,
-            loss: "100%",
-            ok: false,
-          });
-        });
-    });
-  });
-}
-
-// 10. Native Zero-Dependency Multi-Image PDF 1.4 Builder
-
-export function ensureJpegBuffer(buf) {
-  if (!buf || buf.length < 4) return buf;
-  // If already JPEG
-  if (buf[0] === 0xff && buf[1] === 0xd8) {
-    return buf;
-  }
-  // Convert via sips on macOS if available
-  if (process.platform === "darwin") {
-    try {
-      const tmpIn = path.join(
-        os.tmpdir(),
-        `mori_convert_${Date.now()}_${Math.random().toString(36).slice(2)}.tmp`,
-      );
-      const tmpOut = `${tmpIn}.jpg`;
-      fs.writeFileSync(tmpIn, buf);
-      execSync(
-        `sips -s format jpeg "${tmpIn}" --out "${tmpOut}" >/dev/null 2>&1`,
-      );
-      if (fs.existsSync(tmpOut)) {
-        const outBuf = fs.readFileSync(tmpOut);
-        try {
-          fs.unlinkSync(tmpIn);
-        } catch (_) {}
-        try {
-          fs.unlinkSync(tmpOut);
-        } catch (_) {}
-        return outBuf;
-      }
-    } catch (_) {}
-  }
-  // Fallback: try ffmpeg if installed
-  try {
-    const tmpIn = path.join(
-      os.tmpdir(),
-      `mori_convert_${Date.now()}_${Math.random().toString(36).slice(2)}.tmp`,
-    );
-    const tmpOut = `${tmpIn}.jpg`;
-    fs.writeFileSync(tmpIn, buf);
-    execSync(`ffmpeg -y -i "${tmpIn}" "${tmpOut}" >/dev/null 2>&1`);
-    if (fs.existsSync(tmpOut)) {
-      const outBuf = fs.readFileSync(tmpOut);
-      try {
-        fs.unlinkSync(tmpIn);
-      } catch (_) {}
-      try {
-        fs.unlinkSync(tmpOut);
-      } catch (_) {}
-      return outBuf;
-    }
-  } catch (_) {}
-
-  return buf;
-}
-
-export function getImageDimensions(buf) {
-  if (!buf || buf.length < 8) return { width: 595, height: 842 };
-
-  // JPEG
-  if (buf[0] === 0xff && buf[1] === 0xd8) {
-    let offset = 2;
-    while (offset < buf.length - 8) {
-      if (buf[offset] !== 0xff) {
-        offset++;
-        continue;
-      }
-      const marker = buf[offset + 1];
-      if (
-        (marker >= 0xc0 && marker <= 0xc3) ||
-        (marker >= 0xc5 && marker <= 0xc7) ||
-        (marker >= 0xc9 && marker <= 0xcb) ||
-        (marker >= 0xcd && marker <= 0xcf)
-      ) {
-        if (marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
-          return {
-            height: buf.readUInt16BE(offset + 5),
-            width: buf.readUInt16BE(offset + 7),
-          };
-        }
-      }
-      const len = buf.readUInt16BE(offset + 2);
-      offset += 2 + len;
-    }
-  }
-
-  // PNG
-  if (
-    buf[0] === 0x89 &&
-    buf[1] === 0x50 &&
-    buf[2] === 0x4e &&
-    buf[3] === 0x47 &&
-    buf.length >= 24
-  ) {
-    return {
-      width: buf.readUInt32BE(16),
-      height: buf.readUInt32BE(20),
-    };
-  }
-
-  return { width: 595, height: 842 };
-}
-
-export function generateImagesPdf(images) {
-  // images: array of { buffer, width, height }
-  const pageObjIds = images.map((_, i) => 3 + i * 3);
-
-  const obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
-  const kidsStr = pageObjIds.map((id) => `${id} 0 R`).join(" ");
-  const obj2 = `2 0 obj\n<< /Type /Pages /Kids [${kidsStr}] /Count ${images.length} >>\nendobj\n`;
-
-  const parts = [
-    Buffer.from("%PDF-1.4\n"),
-    Buffer.from(obj1),
-    Buffer.from(obj2),
-  ];
-
-  const offsets = [];
-  const totalObjs = 2 + images.length * 3;
-  let currentOffset = "%PDF-1.4\n".length;
-
-  offsets.push(0);
-  offsets.push(currentOffset);
-  currentOffset += Buffer.byteLength(obj1);
-  offsets.push(currentOffset);
-  currentOffset += Buffer.byteLength(obj2);
-
-  for (let i = 0; i < images.length; i++) {
-    const img = images[i];
-    const w = img.width || 595;
-    const h = img.height || 842;
-    const pageId = 3 + i * 3;
-    const imgId = 4 + i * 3;
-    const contentId = 5 + i * 3;
-
-    // Page Object
-    offsets.push(currentOffset);
-    const pageStr = `${pageId} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${w} ${h}] /Resources << /XObject << /Im${i} ${imgId} 0 R >> >> /Contents ${contentId} 0 R >>\nendobj\n`;
-    currentOffset += Buffer.byteLength(pageStr);
-    parts.push(Buffer.from(pageStr));
-
-    // Image XObject (Raw DCTDecode stream)
-    offsets.push(currentOffset);
-    const imgHeader = `${imgId} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${w} /Height ${h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${img.buffer.length} >>\nstream\n`;
-    const imgFooter = "\nendstream\nendobj\n";
-    currentOffset +=
-      Buffer.byteLength(imgHeader) +
-      img.buffer.length +
-      Buffer.byteLength(imgFooter);
-    parts.push(Buffer.from(imgHeader));
-    parts.push(img.buffer);
-    parts.push(Buffer.from(imgFooter));
-
-    // Content Stream
-    offsets.push(currentOffset);
-    const contentData = `q ${w} 0 0 ${h} 0 0 cm /Im${i} Do Q`;
-    const contentStr = `${contentId} 0 obj\n<< /Length ${contentData.length} >>\nstream\n${contentData}\nendstream\nendobj\n`;
-    currentOffset += Buffer.byteLength(contentStr);
-    parts.push(Buffer.from(contentStr));
-  }
-
-  const startxref = currentOffset;
-  let xref = `xref\n0 ${totalObjs + 1}\n0000000000 65535 f \n`;
-  for (let i = 1; i <= totalObjs; i++) {
-    xref += String(offsets[i]).padStart(10, "0") + " 00000 n \n";
-  }
-  const trailer = `trailer\n<< /Size ${totalObjs + 1} /Root 1 0 R >>\nstartxref\n${startxref}\n%%EOF\n`;
-  parts.push(Buffer.from(xref));
-  parts.push(Buffer.from(trailer));
-
-  return Buffer.concat(parts);
-}
-
-export function compileImagesToPdf(imageBuffers, outputPath) {
-  const images = [];
-  for (const rawBuf of imageBuffers) {
-    const jpegBuf = ensureJpegBuffer(rawBuf);
-    const { width, height } = getImageDimensions(jpegBuf);
-    images.push({ buffer: jpegBuf, width, height });
-  }
-  const pdfBuffer = generateImagesPdf(images);
-  fs.writeFileSync(outputPath, pdfBuffer);
-  return { outputPath, bytes: pdfBuffer.length, pages: images.length };
-}
+W.E = { v: SV, run, resolve, detect, clean, PL, http, UA };
+})();
